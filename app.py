@@ -65,7 +65,7 @@ if archivo_dxf is not None:
                 hab_principal = max(cands, key=lambda h: h.area) if cands else envoltura
                 area_habitable = round(hab_principal.area, 2)
 
-                # ESCÁNER DE VANOS (Filtro estricto restaurado)
+                # ESCÁNER DE VANOS CON LÁSER DE PROFUNDIDAD
                 vanos_detectados = []
                 perimetro_simplificado = hab_principal.simplify(0.05, preserve_topology=True)
                 coords_per = list(perimetro_simplificado.exterior.coords)
@@ -78,69 +78,74 @@ if archivo_dxf is not None:
                         segmento = LineString([p1, p2])
                         if segmento.intersection(union_muros).length < (dist * 0.20):
                             pm = Point((p1[0]+p2[0])/2.0, (p1[1]+p2[1])/2.0)
-                            rot = round(math.degrees(math.atan2(p2[1]-p1[1], p2[0]-p1[0])), 1)
                             
-                            espesor_real = 0.15
-                            for poly in muros_solidos:
-                                if poly.distance(pm) < 0.4:
-                                    aprox = poly.area / (poly.length / 2.0)
-                                    estandares = [0.10, 0.15, 0.20, 0.25, 0.30]
-                                    espesor_real = min(estandares, key=lambda x: abs(x - aprox))
-                                    break
+                            # CÁLCULO DEL VECTOR LÁSER (Hacia afuera)
+                            nx, ny = -(p2[1]-p1[1])/dist, (p2[0]-p1[0])/dist
+                            test_pt = Point(pm.x + nx*0.2, pm.y + ny*0.2)
+                            if hab_principal.contains(test_pt):
+                                nx, ny = -nx, -ny # Si apuntaba adentro, lo volteamos afuera
+                                
+                            # DISPARO DEL RAYCAST (1.20 metros de profundidad)
+                            rayo = LineString([(pm.x, pm.y), (pm.x + nx*1.20, pm.y + ny*1.20)])
                             
-                            # CLASIFICACIÓN VITAL: Si mide más de 1.30m, NO es puerta. 
-                            tipo_vano = "puerta" if 0.75 <= dist <= 1.30 else "ventana"
+                            # Si el láser NO choca contra una pared, entonces ES UNA PUERTA REAL
+                            if rayo.intersection(union_muros).length < 0.1:
+                                rot = round(math.degrees(math.atan2(p2[1]-p1[1], p2[0]-p1[0])), 1)
+                                
+                                espesor_real = 0.15
+                                for poly in muros_solidos:
+                                    if poly.distance(pm) < 0.4:
+                                        aprox = poly.area / (poly.length / 2.0)
+                                        estandares = [0.10, 0.15, 0.20, 0.25, 0.30]
+                                        espesor_real = min(estandares, key=lambda x: abs(x - aprox))
+                                        break
+                                
+                                tipo_vano = "puerta" if 0.75 <= dist <= 1.30 else "ventana"
 
-                            vanos_detectados.append({
-                                "tipo": tipo_vano, "cx": pm.x, "cy": pm.y,
-                                "p1": {"x": round(p1[0],2), "y": round(p1[1],2)},
-                                "p2": {"x": round(p2[0],2), "y": round(p2[1],2)},
-                                "ancho": round(dist, 2), "rot": rot, "espesor": espesor_real
-                            })
+                                if not any(math.hypot(pm.x - v['cx'], pm.y - v['cy']) < 0.5 for v in vanos_detectados):
+                                    vanos_detectados.append({
+                                        "tipo": tipo_vano, "cx": pm.x, "cy": pm.y,
+                                        "p1": {"x": round(p1[0],2), "y": round(p1[1],2)},
+                                        "p2": {"x": round(p2[0],2), "y": round(p2[1],2)},
+                                        "ancho": round(dist, 2), "rot": rot, "espesor": espesor_real
+                                    })
 
-            with st.spinner("🪑 Maximizando Aforo con Circulación Segura..."):
+            with st.spinner("🪑 Maximizando Aforo con Burbujas de Despeje..."):
                 aforo_legal_max = math.floor(area_habitable / factor_area)
                 mesas_4p, mesas_2p = [], []
                 
-                area_interior = hab_principal.buffer(-0.95) # Distancia prudente a la pared
-                centro_local = hab_principal.centroid
+                area_interior = hab_principal.buffer(-0.75) 
                 
-                # SOLO las puertas generan pasillo. El hueco ancho arriba ya no bloqueará el salón.
-                pasillos_geom = []
+                burbujas_geom = []
                 for v in vanos_detectados:
                     if v['tipo'] == 'puerta':
-                        linea_pasillo = LineString([(v['cx'], v['cy']), (centro_local.x, centro_local.y)])
-                        pasillos_geom.append(linea_pasillo.buffer(pasillo_min / 2.0))
-                red_prohibida = unary_union(pasillos_geom)
+                        burbujas_geom.append(Point(v['cx'], v['cy']).buffer(1.50))
+                red_prohibida = unary_union(burbujas_geom)
 
                 if area_habitable >= 6.0:
                     bx1, by1, bx2, by2 = hab_principal.bounds
                     
-                    # PASADA 1: MESAS DE 4 (Cuadrícula Holgada = 2.20m)
-                    paso_4p = 2.20 
-                    x_c = bx1 + 1.0
+                    paso_4p = 2.00 
+                    x_c = bx1 + 0.5
                     while x_c <= bx2:
-                        y_c = by1 + 1.0
+                        y_c = by1 + 0.5
                         while y_c <= by2:
                             pt = Point(x_c, y_c)
-                            
                             if area_interior.contains(pt) and not red_prohibida.contains(pt):
-                                # Asegurar 2.10m entre centros de mesas para sillas "abiertas"
-                                if all(math.hypot(x_c - m['x'], y_c - m['y']) >= 2.10 for m in mesas_4p):
+                                if all(math.hypot(x_c - m['x'], y_c - m['y']) >= 1.80 for m in mesas_4p):
                                     mesas_4p.append({"id": "mesa_4p.skp", "x": round(x_c,2), "y": round(y_c,2), "z": 0.0, "rot": 0, "asientos": 4})
                             y_c += paso_4p
                         x_c += paso_4p
 
-                    # PASADA 2: MESAS DE 2 (Relleno sin chocar)
-                    paso_2p = 1.40
-                    rx = bx1 + 0.6
+                    paso_2p = 1.30
+                    rx = bx1 + 0.4
                     while rx <= bx2:
-                        ry = by1 + 0.6
+                        ry = by1 + 0.4
                         while ry <= by2:
                             pt_res = Point(rx, ry)
                             if area_interior.contains(pt_res) and not red_prohibida.contains(pt_res):
-                                libre_4p = all(math.hypot(rx - m['x'], ry - m['y']) >= 1.75 for m in mesas_4p)
-                                libre_2p = all(math.hypot(rx - m['x'], ry - m['y']) >= 1.40 for m in mesas_2p)
+                                libre_4p = all(math.hypot(rx - m['x'], ry - m['y']) >= 1.60 for m in mesas_4p)
+                                libre_2p = all(math.hypot(rx - m['x'], ry - m['y']) >= 1.30 for m in mesas_2p)
                                 if libre_4p and libre_2p:
                                     mesas_2p.append({"id": "mesa_2p.skp", "x": round(rx,2), "y": round(ry,2), "z": 0.0, "rot": 90, "asientos": 2})
                             ry += paso_2p

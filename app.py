@@ -4,6 +4,7 @@ import json
 import tempfile
 import os
 import math
+import gc
 from shapely.geometry import LineString, Point, Polygon, MultiPolygon
 from shapely.ops import unary_union, polygonize, snap
 
@@ -28,45 +29,51 @@ pasillo_min = 1.20
 archivo_dxf = st.file_uploader("📥 Arrastra aquí el plano CAD (.DXF)", type=['dxf'])
 
 if archivo_dxf is not None:
-    # 1. SI ES UN ARCHIVO NUEVO, LO LEEMOS UNA SOLA VEZ
+    # 1. SI ES UN ARCHIVO NUEVO, LO LEEMOS UNA SOLA VEZ Y VACIAMOS RAM
     if st.session_state['nombre_archivo'] != archivo_dxf.name:
         st.session_state['nombre_archivo'] = archivo_dxf.name
-        st.session_state['datos_proyecto'] = None # Resetea resultados anteriores
+        st.session_state['datos_proyecto'] = None 
+        st.session_state['capas_disponibles'] = []
         
         with tempfile.NamedTemporaryFile(delete=False, suffix=".dxf") as tmp_file:
-            tmp_file.write(archivo_dxf.getvalue())
+            tmp_file.write(archivo_dxf.read()) 
             st.session_state['archivo_path'] = tmp_file.name
             
-        with st.spinner("⏳ Descomprimiendo CAD (esto puede tomar unos segundos en archivos pesados)..."):
+        with st.spinner("⏳ Analizando estructura del archivo pesado..."):
             try:
-                doc = ezdxf.readfile(st.session_state['archivo_path'])
+                doc, auditor = ezdxf.recover.readfile(st.session_state['archivo_path'])
                 msp = doc.modelspace()
                 capas = set()
                 for e in msp.query('LINE LWPOLYLINE'):
                     capas.add(e.dxf.layer)
                 st.session_state['capas_disponibles'] = sorted(list(capas))
+                
+                # Vaciar la memoria RAM inmediatamente para que no crashee
+                del doc
+                del msp
+                gc.collect() 
             except Exception as e:
                 st.error(f"Error al leer el archivo: {e}")
 
-    # 2. UI SÚPER RÁPIDA (Ya no lee el archivo al hacer clics)
+    # 2. UI SÚPER RÁPIDA (Traductor de Capas)
     if st.session_state['capas_disponibles']:
-        st.info(f"🔍 Detectamos {len(st.session_state['capas_disponibles'])} capas con geometría en este plano.")
-        
+        st.info(f"🔍 Detectamos {len(st.session_state['capas_disponibles'])} capas.")
         capas_seleccionadas = st.multiselect(
-            "👉 Selecciona SOLO las capas que contienen los MUROS reales (ignora terreno, cotas, muebles):",
-            st.session_state['capas_disponibles'],
-            default=[st.session_state['capas_disponibles'][0]] if st.session_state['capas_disponibles'] else []
+            "👉 Selecciona SOLO la capa de los MUROS:",
+            st.session_state['capas_disponibles']
         )
 
         if st.button("🚀 Procesar Arquitectura Limpia"):
+            if not capas_seleccionadas:
+                st.warning("Debes seleccionar al menos una capa.")
+                st.stop()
+                
             try:
-                with st.spinner("🧠 Filtrando toneladas de ruido y procesando 3D..."):
-                    # Volvemos a abrir el documento solo para extraer lo seleccionado
-                    doc = ezdxf.readfile(st.session_state['archivo_path'])
+                with st.spinner("🧠 Filtrando ruido y procesando 3D..."):
+                    doc, auditor = ezdxf.recover.readfile(st.session_state['archivo_path'])
                     msp = doc.modelspace()
                     
                     muros_crudos = []
-                    # FILTRO PYTHON SÚPER SEGURO
                     for e in msp.query('LINE LWPOLYLINE'):
                         if e.dxf.layer in capas_seleccionadas:
                             if e.dxftype() == 'LINE':
@@ -78,6 +85,11 @@ if archivo_dxf is not None:
                                     if pts[i] != pts[i+1]: muros_crudos.append({"x1": pts[i][0], "y1": pts[i][1], "x2": pts[i+1][0], "y2": pts[i+1][1]})
                                 if getattr(e, 'is_closed', False) and pts[-1] != pts[0]:
                                     muros_crudos.append({"x1": pts[-1][0], "y1": pts[-1][1], "x2": pts[0][0], "y2": pts[0][1]})
+
+                    # Vaciar RAM del CAD de inmediato
+                    del doc
+                    del msp
+                    gc.collect()
 
                     if not muros_crudos:
                         st.error("❌ No se encontraron líneas en las capas seleccionadas.")
@@ -108,7 +120,7 @@ if archivo_dxf is not None:
                     hab_limpia = hab_principal.simplify(0.05, preserve_topology=True)
                     area_habitable = round(hab_limpia.area, 2)
 
-                    # ESCÁNER DE VANOS
+                    # ESCÁNER DE VANOS (Con Láser Raycast)
                     vanos_detectados = []
                     coords_per = list(hab_limpia.exterior.coords)
                     
@@ -163,6 +175,7 @@ if archivo_dxf is not None:
                     if area_habitable >= 6.0 and not area_interior.is_empty:
                         bx1, by1, bx2, by2 = hab_limpia.bounds
                         
+                        # MESAS DE 4 PERSONAS (Holgura Comercial: 1.90m)
                         paso_4p = 1.90 
                         x_c = bx1 + 0.4
                         while x_c <= bx2:
@@ -175,6 +188,7 @@ if archivo_dxf is not None:
                                 y_c += paso_4p
                             x_c += paso_4p
 
+                        # MESAS DE 2 PERSONAS
                         paso_2p = 1.30
                         rx = bx1 + 0.4
                         while rx <= bx2:
@@ -182,42 +196,4 @@ if archivo_dxf is not None:
                             while ry <= by2:
                                 pt_res = Point(rx, ry)
                                 if area_interior.contains(pt_res) and not red_prohibida.contains(pt_res):
-                                    libre_4p = all(math.hypot(rx - m['x'], ry - m['y']) >= 1.60 for m in mesas_4p)
-                                    libre_2p = all(math.hypot(rx - m['x'], ry - m['y']) >= 1.30 for m in mesas_2p)
-                                    if libre_4p and libre_2p:
-                                        mesas_2p.append({"id": "mesa_2p.skp", "x": round(rx,2), "y": round(ry,2), "z": 0.0, "rot": 90, "asientos": 2})
-                                ry += paso_2p
-                            rx += paso_2p
-
-                    asientos_totales = (len(mesas_4p)*4) + (len(mesas_2p)*2)
-                    
-                    muros_export = []
-                    for p in muros_solidos:
-                        p_simp = p.simplify(0.02, preserve_topology=True)
-                        muros_export.append([{"x": round(x,2), "y": round(y,2)} for x,y in p_simp.exterior.coords])
-
-                    datos_proyecto = {
-                        "altura_muros": 2.80,
-                        "muros": muros_export,
-                        "contorno_piso": [{"x": round(x,2), "y": round(y,2)} for x,y in hab_limpia.exterior.coords],
-                        "vanos": vanos_detectados,
-                        "muebles": mesas_4p + mesas_2p,
-                        "reporte": {"area_m2": area_habitable, "aforo_legal": aforo_legal_max, "asientos": asientos_totales}
-                    }
-                    
-                    st.session_state['datos_proyecto'] = json.dumps(datos_proyecto, indent=4)
-                    st.session_state['metrics'] = {
-                        "area": area_habitable, "legal": aforo_legal_max, "asientos": asientos_totales
-                    }
-
-            except Exception as e:
-                st.error(f"❌ Error al procesar: {e}")
-
-if st.session_state['datos_proyecto']:
-    m = st.session_state['metrics']
-    col1, col2, col3 = st.columns(3)
-    col1.metric("📐 Área Útil", f"{m['area']} m²")
-    col2.metric("🏛️ Aforo Legal Máx.", f"{m['legal']} Pax")
-    col3.metric("🪑 Asientos Diseñados", f"{m['asientos']} Pax")
-
-    st.download_button("📦 Descargar JSON de Patty", data=st.session_state['datos_proyecto'], file_name="proyecto.json")
+                                    libre_4p = all(math.hypot(rx - m

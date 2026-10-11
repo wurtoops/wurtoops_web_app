@@ -8,31 +8,59 @@ from shapely.geometry import LineString, Point, Polygon, MultiPolygon, GeometryC
 from shapely.ops import unary_union, polygonize, snap
 
 # Configuración de la pestaña
-st.set_page_config(page_title="Patty | Generador Arquitectónico", page_icon="🏗️", layout="centered")
+st.set_page_config(page_title="Patty | ConTech Engine", page_icon="🏗️", layout="wide")
 
-st.title("🏗️ Patty - Motor de Automatización 2D a 3D")
-st.subheader("Transforma tus planos de CAD a modelos 3D y presupuestos en segundos.")
+st.title("🏗️ Patty - Generador Arquitectónico Paramétrico")
+st.caption("De planos CAD 2D sucios a modelos 3D y cumplimiento normativo en segundos.")
 st.markdown("---")
 
-archivo_dxf = st.file_uploader("📥 Arrastra aquí el plano de tu cliente (.DXF)", type=['dxf'])
+# BARRA LATERAL: MOTOR DE CUMPLIMIENTO NORMATIVO
+st.sidebar.header("🏛️ Parámetros de Cumplimiento")
+normativa_sel = st.sidebar.selectbox(
+    "Normativa Aplicable",
+    ["LatAm - RNE (Norma A.070 / A.130)", "EE.UU. / Int. - IBC / NFPA 101", "España - CTE (DB-SI)"]
+)
+
+tipo_local = st.sidebar.selectbox(
+    "Giro / Uso del Espacio",
+    ["Restaurante Comercial", "Cafetería / Bistro", "Bar / Lounge"]
+)
+
+# Factores normativos según jurisdicción y tipo de uso
+if "RNE" in normativa_sel:
+    factor_area_pax = 1.50 if "Restaurante" in tipo_local else 1.20
+    pasillo_min = 1.20
+elif "IBC" in normativa_sel:
+    factor_area_pax = 1.40 if "Restaurante" in tipo_local else 1.10
+    pasillo_min = 1.00
+else:  # CTE España
+    factor_area_pax = 1.50 if "Restaurante" in tipo_local else 1.25
+    pasillo_min = 1.00
+
+st.sidebar.markdown(f"""
+**Estándar Regulatorio Activo:**
+* Factor de Aforo: `{factor_area_pax} m²/comensal`
+* Pasillo Mínimo Evacuación: `{pasillo_min} m`
+""")
+
+# ZONA DE CARGA
+archivo_dxf = st.file_uploader("📥 Arrastra aquí el plano CAD (.DXF)", type=['dxf'])
 
 if archivo_dxf is not None:
-    st.success(f"✅ Archivo '{archivo_dxf.name}' cargado con éxito.")
+    st.success(f"✅ Archivo '{archivo_dxf.name}' listo para procesamiento.")
     
-    if st.button("🚀 Iniciar Generación Automática"):
+    if st.button("🚀 Procesar Plano y Generar Espacio 3D"):
         
         with tempfile.NamedTemporaryFile(delete=False, suffix=".dxf") as tmp_file:
             tmp_file.write(archivo_dxf.getvalue())
             ruta_temporal = tmp_file.name
 
         try:
-            with st.spinner("🧠 1/3 Leyendo geometría y normalizando al origen..."):
+            with st.spinner("🧠 1/3 Analizando geometría y normalizando al origen..."):
                 doc = ezdxf.readfile(ruta_temporal)
                 msp = doc.modelspace()
                 
                 muros_crudos = []
-                
-                # 1. Extracción de líneas y polilíneas
                 for e in msp.query('LINE LWPOLYLINE'):
                     if e.dxftype() == 'LINE':
                         p1 = (float(e.dxf.start.x), float(e.dxf.start.y))
@@ -56,10 +84,9 @@ if archivo_dxf is not None:
                                     })
 
                 if not muros_crudos:
-                    st.error("❌ No se encontraron líneas válidas en el plano.")
+                    st.error("❌ No se encontraron líneas válidas en el archivo.")
                     st.stop()
 
-                # 2. Detección de escala basada en dimensiones relativas (Bounding Box)
                 todos_x = [m['x1'] for m in muros_crudos] + [m['x2'] for m in muros_crudos]
                 todos_y = [m['y1'] for m in muros_crudos] + [m['y2'] for m in muros_crudos]
                 
@@ -77,7 +104,6 @@ if archivo_dxf is not None:
                     factor = 1000.0
                     unidad_origen = "Milímetros"
 
-                # Traslación a (0, 0) en metros reales
                 lineas_limpias = []
                 for m in muros_crudos:
                     p1 = ((m['x1'] - min_x) / factor, (m['y1'] - min_y) / factor)
@@ -85,122 +111,134 @@ if archivo_dxf is not None:
                     if p1 != p2:
                         lineas_limpias.append(LineString([p1, p2]))
 
-            with st.spinner("🧹 2/3 Sellando vanos de puertas y extrayendo habitación..."):
+            with st.spinner("🧹 2/3 Procesando muros y detectando vanos..."):
                 red_lineas = unary_union(lineas_limpias)
                 red_snapped = snap(red_lineas, red_lineas, tolerance=0.10)
                 red_unida = unary_union(red_snapped)
 
                 poligonos_crudos = list(polygonize(red_unida))
                 muros_solidos = []
-                
                 for poly in poligonos_crudos:
                     if not poly.is_valid or poly.area < 0.05:
                         continue
-                    # Si al erosionar 15 cm desaparece, es un muro sólido de concreto
                     if poly.buffer(-0.15).is_empty:
                         muros_solidos.append(poly)
 
-                # Si no encontramos muros dobles cerrados, usamos las líneas con buffer
                 if not muros_solidos:
                     muro_buffer = red_unida.buffer(0.10)
-                    if isinstance(muro_buffer, MultiPolygon):
-                        muros_solidos = list(muro_buffer.geoms)
-                    else:
-                        muros_solidos = [muro_buffer]
+                    muros_solidos = list(muro_buffer.geoms) if isinstance(muro_buffer, MultiPolygon) else [muro_buffer]
 
                 union_muros = unary_union(muros_solidos)
                 envoltura_total = union_muros.convex_hull
 
-                # EXTRACCIÓN DEL RECINTO INTERIOR (Sustracción Morfológica)
-                # El espacio habitable es el interior de la envoltura menos la masa de concreto de los muros
                 espacio_vacio = envoltura_total.difference(union_muros)
-                
-                candidatos_habitacion = []
+                candidatos = []
                 if isinstance(espacio_vacio, Polygon):
-                    candidatos_habitacion = [espacio_vacio]
+                    candidatos = [espacio_vacio]
                 elif isinstance(espacio_vacio, (MultiPolygon, GeometryCollection)):
                     for g in espacio_vacio.geoms:
                         if isinstance(g, Polygon) and g.area > 2.0:
-                            candidatos_habitacion.append(g)
+                            candidatos.append(g)
 
-                if candidatos_habitacion:
-                    # La habitación principal es el espacio habitable mayor
-                    habitacion_principal = max(candidatos_habitacion, key=lambda h: h.area)
-                else:
-                    habitacion_principal = envoltura_total
-
+                habitacion_principal = max(candidatos, key=lambda h: h.area) if candidatos else envoltura_total
                 area_habitable = round(habitacion_principal.area, 2)
 
-                # 3. DETECCIÓN AUTOMÁTICA DE PUERTAS EN LOS VANOS REALES
-                # Buscamos extremos de muros que tengan separación entre 0.70m y 1.25m
-                extremos_muros = []
+                # Detección de Vanos
+                extremos = []
                 for poly in muros_solidos:
-                    coords = list(poly.exterior.coords)
-                    for pt in coords:
-                        extremos_muros.append(pt)
+                    for pt in poly.exterior.coords:
+                        extremos.append(pt)
 
-                vano_detectado = None
-                for i in range(len(extremos_muros)):
-                    for j in range(i + 1, len(extremos_muros)):
-                        p_a = extremos_muros[i]
-                        p_b = extremos_muros[j]
-                        dist_vano = math.hypot(p_b[0] - p_a[0], p_b[1] - p_a[1])
-                        # Ancho estándar de vano de puerta
-                        if 0.75 <= dist_vano <= 1.25:
-                            # Verificar que el vano colinde con la habitación
-                            punto_medio = Point((p_a[0] + p_b[0])/2.0, (p_a[1] + p_b[1])/2.0)
-                            if habitacion_principal.distance(punto_medio) < 0.5:
-                                vano_detectado = (p_a, p_b)
-                                break
-                    if vano_detectado:
-                        break
+                vanos_detectados = []
+                for i in range(len(extremos)):
+                    for j in range(i + 1, len(extremos)):
+                        pa, pb = extremos[i], extremos[j]
+                        dist = math.hypot(pb[0] - pa[0], pb[1] - pa[1])
+                        if 0.70 <= dist <= 2.00:
+                            pm = Point((pa[0] + pb[0]) / 2.0, (pa[1] + pb[1]) / 2.0)
+                            if habitacion_principal.distance(pm) < 0.6:
+                                if not any(math.hypot(pm.x - v['x'], pm.y - v['y']) < 0.5 for v in vanos_detectados):
+                                    dx = pb[0] - pa[0]
+                                    dy = pb[1] - pa[1]
+                                    rot = round(math.degrees(math.atan2(dy, dx)), 1)
+                                    vanos_detectados.append({
+                                        "tipo": "puerta" if dist <= 1.25 else "ventana",
+                                        "x": round(pm.x, 2),
+                                        "y": round(pm.y, 2),
+                                        "p1": {"x": round(pa[0], 2), "y": round(pa[1], 2)},
+                                        "p2": {"x": round(pb[0], 2), "y": round(pb[1], 2)},
+                                        "ancho": round(dist, 2),
+                                        "rot": rot
+                                    })
 
-                if vano_detectado:
-                    p1_v, p2_v = vano_detectado
-                    x_puerta = (p1_v[0] + p2_v[0]) / 2.0
-                    y_puerta = (p1_v[1] + p2_v[1]) / 2.0
-                    rot_puerta = round(math.degrees(math.atan2(p2_v[1] - p1_v[1], p2_v[0] - p1_v[0])), 1)
-                else:
-                    # Fallback al centroide del primer segmento del recinto
-                    ext_coords = list(habitacion_principal.exterior.coords)
-                    x_puerta = (ext_coords[0][0] + ext_coords[1][0]) / 2.0
-                    y_puerta = (ext_coords[0][1] + ext_coords[1][1]) / 2.0
-                    rot_puerta = 0.0
+            with st.spinner("🪑 3/3 Ejecutando Algoritmo Tetris (Mobiliario Mixto)..."):
+                # CÁLCULO DE AFORO LEGAL MÁXIMO
+                aforo_legal_max = math.floor(area_habitable / factor_area_pax)
 
-                puertas = [{
-                    "id": "puerta.skp",
-                    "x": round(x_puerta, 2),
-                    "y": round(y_puerta, 2),
-                    "z": 0.0,
-                    "rot": rot_puerta
-                }]
-
-            with st.spinner("🪑 3/3 Generando distribución de mobiliario..."):
-                # Aforo de mesas en el interior habitable (clearance perimetral de 1 metro)
-                mesas = []
-                area_mesas = habitacion_principal.buffer(-1.0)
+                # ALGORITMO TETRIS: EMPAQUETAMIENTO EN DOS PASADAS
+                puntos_vanos = [Point(v['x'], v['y']) for v in vanos_detectados]
+                area_interior = habitacion_principal.buffer(-0.80) # 80 cm de margen a muros
                 
-                if not area_mesas.is_empty and area_habitable >= 6.0:
-                    bx1, by1, bx2, by2 = area_mesas.bounds
-                    paso = 2.0  # Espaciado de 2 metros entre ejes de mesas
+                mesas_4p = []
+                mesas_2p = []
+
+                if not area_interior.is_empty and area_habitable >= 6.0:
+                    bx1, by1, bx2, by2 = area_interior.bounds
                     
+                    # PASADA 1: Mesas Principales de 4 Personas (Paso 2.0m)
+                    paso_4p = 2.0
                     x_c = bx1 + 0.6
                     while x_c <= bx2:
                         y_c = by1 + 0.6
                         while y_c <= by2:
                             pt = Point(x_c, y_c)
-                            if area_mesas.contains(pt) and pt.distance(Point(x_puerta, y_puerta)) > 1.8:
-                                mesas.append({
-                                    "id": "mesa.skp",
+                            despeje_accesos = all(pt.distance(pv) > (pasillo_min + 0.6) for pv in puntos_vanos)
+                            if area_interior.contains(pt) and despeje_accesos:
+                                mesas_4p.append({
+                                    "id": "mesa_4p.skp",
                                     "x": round(x_c, 2),
                                     "y": round(y_c, 2),
                                     "z": 0.0,
-                                    "rot": 0
+                                    "rot": 0,
+                                    "tipo": "mesa_4p",
+                                    "asientos": 4
                                 })
-                            y_c += paso
-                        x_c += paso
+                            y_c += paso_4p
+                        x_c += paso_4p
 
-                # ESTRUCTURACIÓN DE MUROS INDEPENDIENTES PARA SKETCHUP
+                    # PASADA 2 (TETRIS): Absorción de Residuos con Mesas de 2 Personas (Módulo 1.4m)
+                    # Excluimos las zonas ya ocupadas por mesas de 4
+                    zonas_ocupadas = [Point(m['x'], m['y']).buffer(1.10) for m in mesas_4p]
+                    zonas_ocupadas.extend([pv.buffer(pasillo_min + 0.5) for pv in puntos_vanos])
+                    area_residual = area_interior.difference(unary_union(zonas_ocupadas))
+
+                    if not area_residual.is_empty:
+                        paso_2p = 1.4
+                        rx = bx1 + 0.4
+                        while rx <= bx2:
+                            ry = by1 + 0.4
+                            while ry <= by2:
+                                pt_res = Point(rx, ry)
+                                if area_residual.contains(pt_res):
+                                    # Verificar que no colisione con otra mesa de 2 recién colocada
+                                    sin_choque = all(pt_res.distance(Point(m['x'], m['y'])) > 1.35 for m in mesas_2p)
+                                    if sin_choque:
+                                        mesas_2p.append({
+                                            "id": "mesa_2p.skp",
+                                            "x": round(rx, 2),
+                                            "y": round(ry, 2),
+                                            "z": 0.0,
+                                            "rot": 0,
+                                            "tipo": "mesa_2p",
+                                            "asientos": 2
+                                        })
+                                ry += paso_2p
+                            rx += paso_2p
+
+                todas_las_mesas = mesas_4p + mesas_2p
+                asientos_totales = (len(mesas_4p) * 4) + (len(mesas_2p) * 2)
+                cumple_norma = asientos_totales <= aforo_legal_max
+
                 muros_export = []
                 for p in muros_solidos:
                     muros_export.append([{"x": round(x, 2), "y": round(y, 2)} for x, y in p.exterior.coords])
@@ -209,29 +247,37 @@ if archivo_dxf is not None:
                     "altura_muros": 2.80,
                     "muros": muros_export,
                     "contorno_piso": [{"x": round(x, 2), "y": round(y, 2)} for x, y in habitacion_principal.exterior.coords],
-                    "puertas": puertas,
-                    "muebles": mesas,
+                    "vanos": vanos_detectados,
+                    "puertas": [v for v in vanos_detectados if v['tipo'] == 'puerta'],
+                    "muebles": todas_las_mesas,
                     "reporte": {
                         "area_m2": area_habitable,
-                        "aforo_mesas": len(mesas),
-                        "muros_detectados": len(muros_solidos)
+                        "aforo_legal_bomberos": aforo_legal_max,
+                        "asientos_comerciales": asientos_totales,
+                        "mesas_4p": len(mesas_4p),
+                        "mesas_2p": len(mesas_2p),
+                        "normativa_aplicada": normativa_sel,
+                        "cumple_normativa": cumple_norma
                     }
                 }
                 
                 json_string = json.dumps(datos_proyecto, indent=4)
 
             st.balloons()
-            st.success("🎉 ¡PROYECTO PROCESADO CON ÉXITO!")
+            st.success("🎉 ¡PROYECTO PROCESADO Y OPTIMIZADO!")
             
-            # Métricas del modelo
-            col1, col2, col3 = st.columns(3)
-            col1.metric("📐 Área Habitable", f"{area_habitable} m²", f"Muros: {len(muros_solidos)}")
-            col2.metric("🪑 Aforo Máximo", f"{len(mesas)} Mesas", "Clearance 1.0m")
-            col3.metric("🚪 Vano de Acceso", f"{rot_puerta}°", f"({round(x_puerta,2)}, {round(y_puerta,2)})")
+            # PANEL DE MÉTRICAS EJECUTIVAS
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("📐 Área Útil", f"{area_habitable} m²")
+            col2.metric("🏛️ Aforo Legal Máx.", f"{aforo_legal_max} Pax", "Límite Bomberos")
+            col3.metric("🪑 Asientos Diseñados", f"{asientos_totales} Pax", f"{len(mesas_4p)} de 4p + {len(mesas_2p)} de 2p")
             
+            if cumple_norma:
+                col4.metric("⚖️ Cumplimiento", "APROBADO", "100% Legal", delta_color="normal")
+            else:
+                col4.metric("⚖️ Cumplimiento", "EXCEDE LÍMITE", "Riesgo de Licencia", delta_color="inverse")
+
             st.markdown("---")
-            st.markdown("### 📥 Descarga tus archivos puente:")
-            
             st.download_button(
                 label="📦 Descargar proyecto.json (Para SketchUp)", 
                 data=json_string, 
@@ -246,5 +292,4 @@ if archivo_dxf is not None:
             if os.path.exists(ruta_temporal):
                 os.remove(ruta_temporal)
 
-st.markdown("---")
-st.caption("Patty Engine MVP v1.3 | Sustracción Morfológica y Vanos Reales")
+st.caption("Patty Engine MVP v2.0 | Algoritmo Tetris y Motor de Cumplimiento Normativo")

@@ -196,4 +196,42 @@ if archivo_dxf is not None:
                             while ry <= by2:
                                 pt_res = Point(rx, ry)
                                 if area_interior.contains(pt_res) and not red_prohibida.contains(pt_res):
-                                    libre_4p = all(math.hypot(rx - m
+                                    libre_4p = all(math.hypot(rx - m['x'], ry - m['y']) >= 1.60 for m in mesas_4p)
+                                    libre_2p = all(math.hypot(rx - m['x'], ry - m['y']) >= 1.30 for m in mesas_2p)
+                                    if libre_4p and libre_2p:
+                                        mesas_2p.append({"id": "mesa_2p.skp", "x": round(rx,2), "y": round(ry,2), "z": 0.0, "rot": 90, "asientos": 2})
+                                ry += paso_2p
+                            rx += paso_2p
+
+                    asientos_totales = (len(mesas_4p)*4) + (len(mesas_2p)*2)
+                    
+                    muros_export = []
+                    for p in muros_solidos:
+                        p_simp = p.simplify(0.02, preserve_topology=True)
+                        muros_export.append([{"x": round(x,2), "y": round(y,2)} for x,y in p_simp.exterior.coords])
+
+                    datos_proyecto = {
+                        "altura_muros": 2.80,
+                        "muros": muros_export,
+                        "contorno_piso": [{"x": round(x,2), "y": round(y,2)} for x,y in hab_limpia.exterior.coords],
+                        "vanos": vanos_detectados,
+                        "muebles": mesas_4p + mesas_2p,
+                        "reporte": {"area_m2": area_habitable, "aforo_legal": aforo_legal_max, "asientos": asientos_totales}
+                    }
+                    
+                    st.session_state['datos_proyecto'] = json.dumps(datos_proyecto, indent=4)
+                    st.session_state['metrics'] = {
+                        "area": area_habitable, "legal": aforo_legal_max, "asientos": asientos_totales
+                    }
+
+            except Exception as e:
+                st.error(f"❌ Error al procesar: {e}")
+
+if st.session_state['datos_proyecto']:
+    m = st.session_state['metrics']
+    col1, col2, col3 = st.columns(3)
+    col1.metric("📐 Área Útil", f"{m['area']} m²")
+    col2.metric("🏛️ Aforo Legal Máx.", f"{m['legal']} Pax")
+    col3.metric("🪑 Asientos Diseñados", f"{m['asientos']} Pax")
+
+    st.download_button("📦 Descargar JSON de Patty", data=st.session_state['datos_proyecto'], file_name="proyecto.json")

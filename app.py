@@ -79,16 +79,14 @@ if archivo_dxf is not None:
                         if segmento.intersection(union_muros).length < (dist * 0.20):
                             pm = Point((p1[0]+p2[0])/2.0, (p1[1]+p2[1])/2.0)
                             
-                            # CÁLCULO DEL VECTOR LÁSER (Hacia afuera)
+                            # LÁSER DE PROFUNDIDAD (Raycast)
                             nx, ny = -(p2[1]-p1[1])/dist, (p2[0]-p1[0])/dist
                             test_pt = Point(pm.x + nx*0.2, pm.y + ny*0.2)
                             if hab_principal.contains(test_pt):
-                                nx, ny = -nx, -ny # Si apuntaba adentro, lo volteamos afuera
+                                nx, ny = -nx, -ny
                                 
-                            # DISPARO DEL RAYCAST (1.20 metros de profundidad)
                             rayo = LineString([(pm.x, pm.y), (pm.x + nx*1.20, pm.y + ny*1.20)])
                             
-                            # Si el láser NO choca contra una pared, entonces ES UNA PUERTA REAL
                             if rayo.intersection(union_muros).length < 0.1:
                                 rot = round(math.degrees(math.atan2(p2[1]-p1[1], p2[0]-p1[0])), 1)
                                 
@@ -114,7 +112,8 @@ if archivo_dxf is not None:
                 aforo_legal_max = math.floor(area_habitable / factor_area)
                 mesas_4p, mesas_2p = [], []
                 
-                area_interior = hab_principal.buffer(-0.75) 
+                # Margen a paredes ampliado a 0.95m para que las sillas no toquen el concreto
+                area_interior = hab_principal.buffer(-0.95) 
                 
                 burbujas_geom = []
                 for v in vanos_detectados:
@@ -125,27 +124,29 @@ if archivo_dxf is not None:
                 if area_habitable >= 6.0:
                     bx1, by1, bx2, by2 = hab_principal.bounds
                     
-                    paso_4p = 2.00 
+                    # PASADA 1: MESAS DE 4 (Grilla holgada a 2.40m, radar estricto a 2.20m)
+                    paso_4p = 2.40 
                     x_c = bx1 + 0.5
                     while x_c <= bx2:
                         y_c = by1 + 0.5
                         while y_c <= by2:
                             pt = Point(x_c, y_c)
                             if area_interior.contains(pt) and not red_prohibida.contains(pt):
-                                if all(math.hypot(x_c - m['x'], y_c - m['y']) >= 1.80 for m in mesas_4p):
+                                if all(math.hypot(x_c - m['x'], y_c - m['y']) >= 2.20 for m in mesas_4p):
                                     mesas_4p.append({"id": "mesa_4p.skp", "x": round(x_c,2), "y": round(y_c,2), "z": 0.0, "rot": 0, "asientos": 4})
                             y_c += paso_4p
                         x_c += paso_4p
 
-                    paso_2p = 1.30
+                    # PASADA 2: MESAS DE 2 (Relleno sin chocar)
+                    paso_2p = 1.40
                     rx = bx1 + 0.4
                     while rx <= bx2:
                         ry = by1 + 0.4
                         while ry <= by2:
                             pt_res = Point(rx, ry)
                             if area_interior.contains(pt_res) and not red_prohibida.contains(pt_res):
-                                libre_4p = all(math.hypot(rx - m['x'], ry - m['y']) >= 1.60 for m in mesas_4p)
-                                libre_2p = all(math.hypot(rx - m['x'], ry - m['y']) >= 1.30 for m in mesas_2p)
+                                libre_4p = all(math.hypot(rx - m['x'], ry - m['y']) >= 1.80 for m in mesas_4p)
+                                libre_2p = all(math.hypot(rx - m['x'], ry - m['y']) >= 1.40 for m in mesas_2p)
                                 if libre_4p and libre_2p:
                                     mesas_2p.append({"id": "mesa_2p.skp", "x": round(rx,2), "y": round(ry,2), "z": 0.0, "rot": 90, "asientos": 2})
                             ry += paso_2p

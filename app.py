@@ -4,7 +4,7 @@ import json
 import tempfile
 import os
 import math
-from shapely.geometry import LineString, Point, Polygon, MultiPolygon, GeometryCollection
+from shapely.geometry import LineString, Point, Polygon, MultiPolygon
 from shapely.ops import unary_union, polygonize, snap
 
 st.set_page_config(page_title="Patty | ConTech Engine", page_icon="🏗️", layout="wide")
@@ -12,22 +12,22 @@ st.title("🏗️ Patty - Generador Arquitectónico Paramétrico")
 st.markdown("---")
 
 st.sidebar.header("🏛️ Parámetros de Cumplimiento")
-normativa_sel = st.sidebar.selectbox("Normativa Aplicable", ["LatAm - RNE", "EE.UU. - IBC", "España - CTE"])
-tipo_local = st.sidebar.selectbox("Giro / Uso", ["Restaurante Comercial", "Cafetería / Bistro"])
+normativa_sel = st.sidebar.selectbox("Normativa", ["LatAm - RNE", "EE.UU. - IBC", "España - CTE"])
+tipo_local = st.sidebar.selectbox("Uso", ["Restaurante Comercial", "Cafetería / Bistro"])
 
 factor_area = 1.50 if "Restaurante" in tipo_local else 1.20
 pasillo_min = 1.20 if "RNE" in normativa_sel else 1.00
 
-archivo_dxf = st.file_uploader("📥 Arrastra aquí el plano CAD (.DXF)", type=['dxf'])
+archivo_dxf = st.file_uploader("📥 Arrastra el plano CAD (.DXF)", type=['dxf'])
 
 if archivo_dxf is not None:
-    if st.button("🚀 Procesar Plano y Generar Espacio 3D"):
+    if st.button("🚀 Procesar Plano y Generar 3D"):
         with tempfile.NamedTemporaryFile(delete=False, suffix=".dxf") as tmp_file:
             tmp_file.write(archivo_dxf.getvalue())
             ruta_temporal = tmp_file.name
 
         try:
-            with st.spinner("🧠 1/3 Analizando geometría..."):
+            with st.spinner("🧠 Analizando geometría y muros..."):
                 doc = ezdxf.readfile(ruta_temporal)
                 msp = doc.modelspace()
                 muros_crudos = []
@@ -48,99 +48,94 @@ if archivo_dxf is not None:
                 dim_mayor = max(max(todos_x) - min_x, max(todos_y) - min_y)
                 factor = 1.0 if dim_mayor < 200 else (100.0 if dim_mayor < 25000 else 1000.0)
 
-                lineas_limpias = [LineString([((m['x1']-min_x)/factor, (m['y1']-min_y)/factor), ((m['x2']-min_x)/factor, (m['y2']-min_y)/factor)]) for m in muros_crudos if m['x1']!=m['x2'] or m['y1']!=m['y2']]
-
-            with st.spinner("🧹 2/3 Procesando muros y detectando vanos cruzados..."):
+                lineas_limpias = [LineString([((m['x1']-min_x)/factor, (m['y1']-min_y)/factor), ((m['x2']-min_x)/factor, (m['y2']-min_y)/factor)]) for m in muros_crudos]
                 red_unida = unary_union(snap(unary_union(lineas_limpias), unary_union(lineas_limpias), tolerance=0.10))
-                muros_solidos = [p for p in polygonize(red_unida) if not p.buffer(-0.15).is_empty]
+                
+                muros_solidos = [p for p in polygonize(red_unida) if not p.buffer(-0.10).is_empty]
                 if not muros_solidos:
-                    muro_buffer = red_unida.buffer(0.10)
-                    muros_solidos = list(muro_buffer.geoms) if isinstance(muro_buffer, MultiPolygon) else [muro_buffer]
-
-                envoltura = unary_union(muros_solidos).convex_hull
-                vacios = envoltura.difference(unary_union(muros_solidos))
+                    muros_solidos = [red_unida.buffer(0.10)]
+                union_solidos = unary_union(muros_solidos)
+                
+                envoltura = union_solidos.convex_hull
+                vacios = envoltura.difference(union_solidos)
                 cands = [g for g in (vacios.geoms if hasattr(vacios, 'geoms') else [vacios]) if isinstance(g, Polygon) and g.area > 2.0]
                 hab_principal = max(cands, key=lambda h: h.area) if cands else envoltura
                 area_habitable = round(hab_principal.area, 2)
 
-                # NUEVA DETECCIÓN DE PUERTAS (Solo entre MUROS DIFERENTES)
+                # NUEVO DETECTOR TOPOLÓGICO DE VANOS (Cero Falsos Positivos)
                 vanos_detectados = []
-                extremos_por_muro = [list(poly.exterior.coords) for poly in muros_solidos]
-                
-                for i in range(len(muros_solidos)):
-                    for j in range(i + 1, len(muros_solidos)):
-                        for pa in extremos_por_muro[i]:
-                            for pb in extremos_por_muro[j]:
-                                dist = math.hypot(pb[0]-pa[0], pb[1]-pa[1])
-                                if 0.70 <= dist <= 2.50:
-                                    pm = Point((pa[0]+pb[0])/2, (pa[1]+pb[1])/2)
-                                    if hab_principal.distance(pm) < 0.5:
-                                        if not any(math.hypot(pm.x - v['cx'], pm.y - v['cy']) < 0.5 for v in vanos_detectados):
-                                            rot = round(math.degrees(math.atan2(pb[1]-pa[1], pb[0]-pa[0])), 1)
-                                            vanos_detectados.append({
-                                                "tipo": "puerta" if dist <= 1.25 else "ventana",
-                                                "cx": pm.x, "cy": pm.y,
-                                                "p1": {"x": round(pa[0],2), "y": round(pa[1],2)},
-                                                "p2": {"x": round(pb[0],2), "y": round(pb[1],2)},
-                                                "ancho": round(dist, 2), "rot": rot
-                                            })
+                coords_perimetro = list(hab_principal.exterior.coords)
+                for i in range(len(coords_perimetro) - 1):
+                    p1, p2 = coords_perimetro[i], coords_perimetro[i+1]
+                    segmento = LineString([p1, p2])
+                    
+                    # Si el segmento del contorno no choca con un muro de concreto, ES UN HUECO REAL
+                    if segmento.distance(union_solidos) > 0.05:
+                        longitud = segmento.length
+                        if 0.70 <= longitud <= 2.80:
+                            cx, cy = (p1[0]+p2[0])/2.0, (p1[1]+p2[1])/2.0
+                            rot = round(math.degrees(math.atan2(p2[1]-p1[1], p2[0]-p1[0])), 1)
+                            vanos_detectados.append({
+                                "tipo": "puerta" if longitud <= 1.30 else "ventana",
+                                "cx": cx, "cy": cy,
+                                "p1": {"x": round(p1[0],2), "y": round(p1[1],2)},
+                                "p2": {"x": round(p2[0],2), "y": round(p2[1],2)},
+                                "ancho": round(longitud, 2), "rot": rot
+                            })
 
-            with st.spinner("🪑 3/3 Ejecutando Algoritmo de Circulación y Aforo..."):
+            with st.spinner("🪑 Asignando Mobiliario sin Colisiones..."):
                 aforo_legal_max = math.floor(area_habitable / factor_area)
                 mesas_4p, mesas_2p = [], []
                 
-                # ZONAS PROHIBIDAS (Muros + Pasillo Central)
-                area_interior = hab_principal.buffer(-1.20) # Mayor margen a las paredes
+                area_interior = hab_principal.buffer(-1.00) # Respeto a los muros
                 centro_local = hab_principal.centroid
-                pasillos_geom = []
-                for v in vanos_detectados:
-                    linea_pasillo = LineString([(v['cx'], v['cy']), (centro_local.x, centro_local.y)])
-                    pasillos_geom.append(linea_pasillo.buffer(pasillo_min / 2.0))
                 
+                # Autopista de pasillos
+                pasillos_geom = [LineString([(v['cx'], v['cy']), (centro_local.x, centro_local.y)]).buffer(pasillo_min / 2.0) for v in vanos_detectados]
                 red_prohibida = unary_union(pasillos_geom)
 
                 if not area_interior.is_empty and area_habitable >= 6.0:
                     bx1, by1, bx2, by2 = area_interior.bounds
                     
-                    # PASADA 1: Mesas de 4p (Espaciado amplio)
-                    paso_4p = 2.40 
-                    x_c = bx1 + 0.5
+                    # PASADA 1: Mesas de 4 Personas
+                    paso_4p = 2.40
+                    x_c = bx1 + 0.6
                     while x_c <= bx2:
-                        y_c = by1 + 0.5
+                        y_c = by1 + 0.6
                         while y_c <= by2:
                             pt = Point(x_c, y_c)
                             if area_interior.contains(pt) and not red_prohibida.contains(pt):
-                                mesas_4p.append({"id": "mesa_4p.skp", "x": round(x_c,2), "y": round(y_c,2), "z": 0.0, "rot": 0, "asientos": 4})
+                                # Evitar colisión con otras mesas 4p
+                                if all(pt.distance(Point(m['x'], m['y'])) >= 2.0 for m in mesas_4p):
+                                    mesas_4p.append({"id": "mesa_4p.skp", "x": round(x_c,2), "y": round(y_c,2), "z": 0.0, "rot": 0, "asientos": 4})
                             y_c += paso_4p
                         x_c += paso_4p
 
-                    # PASADA 2: Relleno 2p
-                    zonas_ocupadas = [Point(m['x'], m['y']).buffer(1.30) for m in mesas_4p] + pasillos_geom
-                    area_residual = area_interior.difference(unary_union(zonas_ocupadas))
-                    
-                    if not area_residual.is_empty:
-                        paso_2p = 1.80
-                        rx = bx1 + 0.5
-                        while rx <= bx2:
-                            ry = by1 + 0.5
-                            while ry <= by2:
-                                pt_res = Point(rx, ry)
-                                if area_residual.contains(pt_res) and all(pt_res.distance(Point(m['x'], m['y'])) > 1.4 for m in mesas_2p):
+                    # PASADA 2: Mesas de 2 Personas (Relleno Seguro)
+                    paso_2p = 1.40
+                    rx = bx1 + 0.5
+                    while rx <= bx2:
+                        ry = by1 + 0.5
+                        while ry <= by2:
+                            pt = Point(rx, ry)
+                            if area_interior.contains(pt) and not red_prohibida.contains(pt):
+                                # Triple Check Anticolisión
+                                if all(pt.distance(Point(m['x'], m['y'])) >= 1.6 for m in mesas_4p) and \
+                                   all(pt.distance(Point(m['x'], m['y'])) >= 1.2 for m in mesas_2p):
                                     mesas_2p.append({"id": "mesa_2p.skp", "x": round(rx,2), "y": round(ry,2), "z": 0.0, "rot": 0, "asientos": 2})
-                                ry += paso_2p
-                            rx += paso_2p
+                            ry += paso_2p
+                        rx += paso_2p
 
-                asientos_totales = (len(mesas_4p)*4) + (len(mesas_2p)*2)
-                
                 datos_proyecto = {
                     "altura_muros": 2.80,
                     "muros": [[{"x": round(x,2), "y": round(y,2)} for x,y in p.exterior.coords] for p in muros_solidos],
                     "contorno_piso": [{"x": round(x,2), "y": round(y,2)} for x,y in hab_principal.exterior.coords],
                     "vanos": vanos_detectados,
                     "muebles": mesas_4p + mesas_2p,
-                    "reporte": {"area_m2": area_habitable, "aforo_legal": aforo_legal_max, "asientos": asientos_totales}
+                    "reporte": {"area_m2": area_habitable, "aforo_legal": aforo_legal_max, "asientos": (len(mesas_4p)*4) + (len(mesas_2p)*2)}
                 }
                 
+                st.success("🎉 ¡Modelo Optimizado Correctamente!")
                 st.download_button("📦 Descargar proyecto.json", data=json.dumps(datos_proyecto, indent=4), file_name="proyecto.json")
 
         except Exception as e:

@@ -6,6 +6,7 @@ import os
 import math
 from shapely.geometry import LineString, Point, Polygon, MultiPolygon
 from shapely.ops import unary_union, polygonize, snap
+import shapely
 
 st.set_page_config(page_title="Patty | ConTech Engine", page_icon="🏗️", layout="centered")
 st.title("🏗️ Patty - Generador Arquitectónico Paramétrico")
@@ -51,9 +52,12 @@ if archivo_dxf is not None:
                 lineas_limpias = [LineString([((m['x1']-min_x)/factor, (m['y1']-min_y)/factor), ((m['x2']-min_x)/factor, (m['y2']-min_y)/factor)]) for m in muros_crudos if m['x1']!=m['x2'] or m['y1']!=m['y2']]
 
                 red_unida = unary_union(snap(unary_union(lineas_limpias), unary_union(lineas_limpias), tolerance=0.10))
+                
+                # CREACIÓN DE MUROS (Con esquinas afiladas profesionales: cap_style=2, join_style=2)
                 muros_solidos = [p for p in polygonize(red_unida) if p.is_valid and p.buffer(-0.10).is_empty]
                 if not muros_solidos:
-                    muros_solidos = list(red_unida.buffer(0.10).geoms) if isinstance(red_unida.buffer(0.10), MultiPolygon) else [red_unida.buffer(0.10)]
+                    muro_buffer = red_unida.buffer(0.10, cap_style=2, join_style=2)
+                    muros_solidos = list(muro_buffer.geoms) if isinstance(muro_buffer, MultiPolygon) else [muro_buffer]
 
                 union_muros = unary_union(muros_solidos)
                 envoltura = union_muros.convex_hull
@@ -63,33 +67,40 @@ if archivo_dxf is not None:
                 hab_principal = max(cands, key=lambda h: h.area) if cands else envoltura
                 area_habitable = round(hab_principal.area, 2)
 
-                # ESCÁNER DE VANOS
+                # ESCÁNER DE VANOS POR "RAYCAST"
                 vanos_detectados = []
-                coords_per = list(hab_principal.exterior.coords)
+                # Simplificamos el perímetro para evitar micro-segmentos
+                perimetro_simplificado = hab_principal.simplify(0.05, preserve_topology=True)
+                coords_per = list(perimetro_simplificado.exterior.coords)
+                
                 for i in range(len(coords_per) - 1):
                     p1, p2 = coords_per[i], coords_per[i+1]
                     dist = math.hypot(p2[0]-p1[0], p2[1]-p1[1])
+                    
                     if 0.70 <= dist <= 2.80:
-                        pm = Point((p1[0]+p2[0])/2.0, (p1[1]+p2[1])/2.0)
-                        if pm.distance(union_muros) > 0.05:
+                        segmento = LineString([p1, p2])
+                        # Si más del 80% del segmento está en el aire (no intersecta muros), ES UNA PUERTA
+                        longitud_interseccion = segmento.intersection(union_muros).length
+                        if longitud_interseccion < (dist * 0.20):
+                            pm = Point((p1[0]+p2[0])/2.0, (p1[1]+p2[1])/2.0)
                             rot = round(math.degrees(math.atan2(p2[1]-p1[1], p2[0]-p1[0])), 1)
-                            if not any(math.hypot(pm.x - v['cx'], pm.y - v['cy']) < 0.5 for v in vanos_detectados):
-                                espesor_real = 0.15
-                                for poly in muros_solidos:
-                                    if poly.distance(pm) < 0.2:
-                                        aprox = poly.area / (poly.length / 2.0)
-                                        estandares = [0.10, 0.15, 0.20, 0.25, 0.30]
-                                        espesor_real = min(estandares, key=lambda x: abs(x - aprox))
-                                        break
+                            
+                            espesor_real = 0.15
+                            for poly in muros_solidos:
+                                if poly.distance(pm) < 0.4:
+                                    aprox = poly.area / (poly.length / 2.0)
+                                    estandares = [0.10, 0.15, 0.20, 0.25, 0.30]
+                                    espesor_real = min(estandares, key=lambda x: abs(x - aprox))
+                                    break
 
-                                vanos_detectados.append({
-                                    "tipo": "puerta", "cx": pm.x, "cy": pm.y,
-                                    "p1": {"x": round(p1[0],2), "y": round(p1[1],2)},
-                                    "p2": {"x": round(p2[0],2), "y": round(p2[1],2)},
-                                    "ancho": round(dist, 2), "rot": rot, "espesor": espesor_real
-                                })
+                            vanos_detectados.append({
+                                "tipo": "puerta", "cx": pm.x, "cy": pm.y,
+                                "p1": {"x": round(p1[0],2), "y": round(p1[1],2)},
+                                "p2": {"x": round(p2[0],2), "y": round(p2[1],2)},
+                                "ancho": round(dist, 2), "rot": rot, "espesor": espesor_real
+                            })
 
-            with st.spinner("🪑 Distribuyendo Mobiliario en Cuadrícula Unificada..."):
+            with st.spinner("🪑 Distribuyendo Mobiliario Arquitectónico..."):
                 aforo_legal_max = math.floor(area_habitable / factor_area)
                 mesas_4p, mesas_2p = [], []
                 
@@ -100,7 +111,6 @@ if archivo_dxf is not None:
                 if area_habitable >= 6.0:
                     bx1, by1, bx2, by2 = hab_principal.bounds
                     
-                    # CUADRÍCULA MAESTRA UNIFICADA (Evita el desorden)
                     paso = 2.20 
                     x_c = bx1 + 1.0
                     while x_c <= bx2:
@@ -108,18 +118,16 @@ if archivo_dxf is not None:
                         while y_c <= by2:
                             pt = Point(x_c, y_c)
                             
-                            # Validar que esté dentro de la habitación y no en el pasillo de evacuación
                             if hab_principal.contains(pt) and not red_prohibida.contains(pt):
                                 dist_muro = pt.distance(union_muros)
                                 dist_pasillo = pt.distance(red_prohibida) if not red_prohibida.is_empty else 99.0
                                 
-                                # Prioridad 1: Intenta poner Mesa de 4p (Requiere 1.1m a paredes y 0.8m a pasillos)
-                                if dist_muro >= 1.10 and dist_pasillo >= 0.80:
+                                # Acomodo orgánico: las mesas de 4 en áreas libres, las de 2 cerca a paredes o vacíos
+                                if dist_muro >= 1.00 and dist_pasillo >= 0.80:
                                     mesas_4p.append({"id": "mesa_4p.skp", "x": round(x_c,2), "y": round(y_c,2), "z": 0.0, "rot": 0, "asientos": 4})
-                                
-                                # Prioridad 2: Si no cabe de 4, pone Mesa de 2p EN EL MISMO EJE EXACTO
-                                elif dist_muro >= 0.85 and dist_pasillo >= 0.50:
-                                    mesas_2p.append({"id": "mesa_2p.skp", "x": round(x_c,2), "y": round(y_c,2), "z": 0.0, "rot": 0, "asientos": 2})
+                                elif dist_muro >= 0.70 and dist_pasillo >= 0.40:
+                                    # Gira la mesa de 2 personas para que se acomode contra el muro
+                                    mesas_2p.append({"id": "mesa_2p.skp", "x": round(x_c,2), "y": round(y_c,2), "z": 0.0, "rot": 90, "asientos": 2})
                                     
                             y_c += paso
                         x_c += paso
@@ -145,7 +153,6 @@ if archivo_dxf is not None:
         finally:
             if os.path.exists(ruta_temporal): os.remove(ruta_temporal)
 
-# UI PERSISTENTE
 if st.session_state['datos_proyecto']:
     m = st.session_state['metrics']
     col1, col2, col3 = st.columns(3)

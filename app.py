@@ -65,7 +65,7 @@ if archivo_dxf is not None:
                 hab_principal = max(cands, key=lambda h: h.area) if cands else envoltura
                 area_habitable = round(hab_principal.area, 2)
 
-                # ESCÁNER DE VANOS CON LÁSER DE PROFUNDIDAD
+                # ESCÁNER DE VANOS
                 vanos_detectados = []
                 perimetro_simplificado = hab_principal.simplify(0.05, preserve_topology=True)
                 coords_per = list(perimetro_simplificado.exterior.coords)
@@ -79,7 +79,7 @@ if archivo_dxf is not None:
                         if segmento.intersection(union_muros).length < (dist * 0.20):
                             pm = Point((p1[0]+p2[0])/2.0, (p1[1]+p2[1])/2.0)
                             
-                            # LÁSER DE PROFUNDIDAD (Raycast)
+                            # LÁSER DE PROFUNDIDAD
                             nx, ny = -(p2[1]-p1[1])/dist, (p2[0]-p1[0])/dist
                             test_pt = Point(pm.x + nx*0.2, pm.y + ny*0.2)
                             if hab_principal.contains(test_pt):
@@ -108,45 +108,47 @@ if archivo_dxf is not None:
                                         "ancho": round(dist, 2), "rot": rot, "espesor": espesor_real
                                     })
 
-            with st.spinner("🪑 Maximizando Aforo con Burbujas de Despeje..."):
+            with st.spinner("🪑 Calculando Aforo Comercial Ideal..."):
                 aforo_legal_max = math.floor(area_habitable / factor_area)
                 mesas_4p, mesas_2p = [], []
                 
-                # Margen a paredes ampliado a 0.95m para que las sillas no toquen el concreto
-                area_interior = hab_principal.buffer(-0.95) 
+                # Margen de 80cm a la pared (ideal para sillas guardadas)
+                area_interior = hab_principal.buffer(-0.80) 
                 
+                # Burbuja de evacuación ajustada a 1.20m en la puerta
                 burbujas_geom = []
                 for v in vanos_detectados:
                     if v['tipo'] == 'puerta':
-                        burbujas_geom.append(Point(v['cx'], v['cy']).buffer(1.50))
+                        burbujas_geom.append(Point(v['cx'], v['cy']).buffer(1.20))
                 red_prohibida = unary_union(burbujas_geom)
 
                 if area_habitable >= 6.0:
                     bx1, by1, bx2, by2 = hab_principal.bounds
                     
-                    # PASADA 1: MESAS DE 4 (Grilla holgada a 2.40m, radar estricto a 2.20m)
-                    paso_4p = 2.40 
-                    x_c = bx1 + 0.5
+                    # PASADA 1: MESAS DE 4 (Grilla óptima comercial a 1.90m)
+                    paso_4p = 1.90 
+                    x_c = bx1 + 0.4
                     while x_c <= bx2:
-                        y_c = by1 + 0.5
+                        y_c = by1 + 0.4
                         while y_c <= by2:
                             pt = Point(x_c, y_c)
                             if area_interior.contains(pt) and not red_prohibida.contains(pt):
-                                if all(math.hypot(x_c - m['x'], y_c - m['y']) >= 2.20 for m in mesas_4p):
+                                # Radar ajustado a 1.80m
+                                if all(math.hypot(x_c - m['x'], y_c - m['y']) >= 1.80 for m in mesas_4p):
                                     mesas_4p.append({"id": "mesa_4p.skp", "x": round(x_c,2), "y": round(y_c,2), "z": 0.0, "rot": 0, "asientos": 4})
                             y_c += paso_4p
                         x_c += paso_4p
 
-                    # PASADA 2: MESAS DE 2 (Relleno sin chocar)
-                    paso_2p = 1.40
+                    # PASADA 2: MESAS DE 2 (Relleno orgánico)
+                    paso_2p = 1.30
                     rx = bx1 + 0.4
                     while rx <= bx2:
                         ry = by1 + 0.4
                         while ry <= by2:
                             pt_res = Point(rx, ry)
                             if area_interior.contains(pt_res) and not red_prohibida.contains(pt_res):
-                                libre_4p = all(math.hypot(rx - m['x'], ry - m['y']) >= 1.80 for m in mesas_4p)
-                                libre_2p = all(math.hypot(rx - m['x'], ry - m['y']) >= 1.40 for m in mesas_2p)
+                                libre_4p = all(math.hypot(rx - m['x'], ry - m['y']) >= 1.60 for m in mesas_4p)
+                                libre_2p = all(math.hypot(rx - m['x'], ry - m['y']) >= 1.30 for m in mesas_2p)
                                 if libre_4p and libre_2p:
                                     mesas_2p.append({"id": "mesa_2p.skp", "x": round(rx,2), "y": round(ry,2), "z": 0.0, "rot": 90, "asientos": 2})
                             ry += paso_2p

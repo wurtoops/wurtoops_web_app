@@ -1,123 +1,166 @@
-require 'json'
+import streamlit as st
+import ezdxf
+import json
+import tempfile
+import os
+import math
+from shapely.geometry import LineString, Point, Polygon, MultiPolygon
+from shapely.ops import unary_union, polygonize, snap
 
-module PattyEngine
-  def self.construir
-    model = Sketchup.active_model
-    path = UI.openpanel("Seleccionar JSON Patty", "", "JSON|*.json;||")
-    return unless path && File.exist?(path)
-    
-    dir = File.dirname(path)
-    data = JSON.parse(File.read(path))
-    
-    model.start_operation("Patty Automático", true)
-    begin
-      model.entities.erase_entities(model.entities.to_a)
-      model.definitions.purge_unused
-      
-      ly_muros = model.layers.add("PATTY_MUROS")
-      ly_piso = model.layers.add("PATTY_PISOS")
-      ly_vanos = model.layers.add("PATTY_VANOS")
-      ly_muebles = model.layers.add("PATTY_MUEBLES")
-      
-      h_muro = (data['altura_muros'] || 2.8).to_f.m
-      
-      # MUROS
-      g_muros = model.entities.add_group
-      g_muros.layer = ly_muros
-      data['muros'].each do |pts|
-        limpios = sanear(pts)
-        next if limpios.size < 3
-        face = g_muros.entities.add_face(limpios)
-        if face
-          face.reverse! if face.normal.z < 0
-          face.pushpull(h_muro)
-        end
-      end
-      
-      # PISO
-      if data['contorno_piso']
-        g_piso = model.entities.add_group
-        g_piso.layer = ly_piso
-        face = g_piso.entities.add_face(sanear(data['contorno_piso']))
-        if face
-          face.reverse! if face.normal.z < 0
-          face.pushpull(-0.05.m)
-        end
-      end
-      
-      # VANOS, DINTELES AL RAS Y PUERTAS
-      g_vanos = model.entities.add_group
-      g_vanos.layer = ly_vanos
-      (data['vanos'] || []).each do |v|
-        p1 = Geom::Point3d.new(v['p1']['x'].to_f.m, v['p1']['y'].to_f.m, 0)
-        p2 = Geom::Point3d.new(v['p2']['x'].to_f.m, v['p2']['y'].to_f.m, 0)
-        
-        dx, dy = p2.x - p1.x, p2.y - p1.y
-        len = Math.hypot(dx, dy)
-        next if len < 0.3.m
-        
-        nx, ny = -dy/len, dx/len
-        
-        # Grosor automático inferido por Python
-        espesor = (v['espesor'] || 0.15).to_f.m 
-        off_x, off_y = nx * (espesor / 2.0), ny * (espesor / 2.0)
-        
-        # Dintel Centrado (Al coincidir con el grosor de la pared, queda liso de ambos lados)
-        h_d = h_muro - 2.10.m
-        pts_d = [
-          Geom::Point3d.new(p1.x+off_x, p1.y+off_y, 2.1.m),
-          Geom::Point3d.new(p2.x+off_x, p2.y+off_y, 2.1.m),
-          Geom::Point3d.new(p2.x-off_x, p2.y-off_y, 2.1.m),
-          Geom::Point3d.new(p1.x-off_x, p1.y-off_y, 2.1.m)
-        ]
-        face_d = g_vanos.entities.add_face(pts_d)
-        if face_d
-          face_d.reverse! if face_d.normal.z < 0
-          face_d.pushpull(h_d)
-        end
-        
-        # Puerta
-        skp = File.join(dir, "puerta.skp")
-        tr_rot = Geom::Transformation.rotation(Geom::Point3d.new(0,0,0), Geom::Vector3d.new(0,0,1), v['rot'].to_f.degrees)
-        tr_pos = Geom::Transformation.translation(Geom::Vector3d.new(p1.x, p1.y, 0))
-        tr_final = tr_pos * tr_rot
-        
-        if File.exist?(skp)
-          inst = g_vanos.entities.add_instance(model.definitions.load(skp), tr_final)
-          min_z = inst.bounds.min.z
-          inst.transform!(Geom::Transformation.translation(Geom::Vector3d.new(0, 0, -min_z))) if min_z.abs > 0.01.m
-        end
-      end
-      
-      # MUEBLES
-      g_muebles = model.entities.add_group
-      g_muebles.layer = ly_muebles
-      (data['muebles'] || []).each do |m|
-        skp = File.join(dir, m['id'])
-        tr_pos = Geom::Transformation.translation(Geom::Vector3d.new(m['x'].to_f.m, m['y'].to_f.m, 0))
-        
-        if File.exist?(skp)
-          inst = g_muebles.entities.add_instance(model.definitions.load(skp), tr_pos)
-          min_z = inst.bounds.min.z
-          inst.transform!(Geom::Transformation.translation(Geom::Vector3d.new(0, 0, -min_z))) if min_z.abs > 0.01.m
-        end
-      end
-      
-      model.commit_operation
-      model.active_view.zoom_extents
-    rescue => e
-      model.abort_operation
-      UI.messagebox("Error: #{e.message}")
-    end
-  end
+st.set_page_config(page_title="Patty | ConTech Engine", page_icon="🏗️", layout="centered")
+st.title("🏗️ Patty - Generador Arquitectónico Paramétrico")
+st.markdown("---")
 
-  def self.sanear(pts)
-    raw = pts.map { |p| Geom::Point3d.new(p['x'].to_f.m, p['y'].to_f.m, 0) }
-    unq = []
-    raw.each { |p| unq << p if unq.empty? || unq.last.distance(p) > 0.005.m }
-    unq.pop if unq.size > 1 && unq.first.distance(unq.last) < 0.005.m
-    unq
-  end
-end
+# MANTENER EL ESTADO DE LA UI
+if 'datos_proyecto' not in st.session_state:
+    st.session_state['datos_proyecto'] = None
+    st.session_state['metrics'] = None
 
-PattyEngine.construir
+# PARÁMETROS UNIVERSALES (Cero inputs del usuario)
+factor_area = 1.50  # Estándar comercial internacional
+pasillo_min = 1.20  # Estándar de evacuación seguro
+
+archivo_dxf = st.file_uploader("📥 Arrastra aquí el plano CAD (.DXF)", type=['dxf'])
+
+if archivo_dxf is not None:
+    if st.button("🚀 Generar 3D Automáticamente"):
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".dxf") as tmp_file:
+            tmp_file.write(archivo_dxf.getvalue())
+            ruta_temporal = tmp_file.name
+
+        try:
+            with st.spinner("🧠 Analizando geometría y deduciendo espesores..."):
+                doc = ezdxf.readfile(ruta_temporal)
+                msp = doc.modelspace()
+                muros_crudos = []
+                for e in msp.query('LINE LWPOLYLINE'):
+                    if e.dxftype() == 'LINE':
+                        p1, p2 = (e.dxf.start.x, e.dxf.start.y), (e.dxf.end.x, e.dxf.end.y)
+                        if p1 != p2: muros_crudos.append({"x1": p1[0], "y1": p1[1], "x2": p2[0], "y2": p2[1]})
+                    elif e.dxftype() == 'LWPOLYLINE':
+                        pts = [(float(p[0]), float(p[1])) for p in e.get_points('xy')]
+                        for i in range(len(pts) - 1):
+                            if pts[i] != pts[i+1]: muros_crudos.append({"x1": pts[i][0], "y1": pts[i][1], "x2": pts[i+1][0], "y2": pts[i+1][1]})
+                        if getattr(e, 'is_closed', False) and pts[-1] != pts[0]:
+                            muros_crudos.append({"x1": pts[-1][0], "y1": pts[-1][1], "x2": pts[0][0], "y2": pts[0][1]})
+
+                todos_x = [m['x1'] for m in muros_crudos] + [m['x2'] for m in muros_crudos]
+                todos_y = [m['y1'] for m in muros_crudos] + [m['y2'] for m in muros_crudos]
+                min_x, min_y = min(todos_x), min(todos_y)
+                dim_mayor = max(max(todos_x) - min_x, max(todos_y) - min_y)
+                factor = 1.0 if dim_mayor < 200 else (100.0 if dim_mayor < 25000 else 1000.0)
+
+                lineas_limpias = [LineString([((m['x1']-min_x)/factor, (m['y1']-min_y)/factor), ((m['x2']-min_x)/factor, (m['y2']-min_y)/factor)]) for m in muros_crudos if m['x1']!=m['x2'] or m['y1']!=m['y2']]
+
+                red_unida = unary_union(snap(unary_union(lineas_limpias), unary_union(lineas_limpias), tolerance=0.10))
+                muros_solidos = [p for p in polygonize(red_unida) if p.is_valid and p.buffer(-0.10).is_empty]
+                if not muros_solidos:
+                    muros_solidos = list(red_unida.buffer(0.10).geoms) if isinstance(red_unida.buffer(0.10), MultiPolygon) else [red_unida.buffer(0.10)]
+
+                union_muros = unary_union(muros_solidos)
+                envoltura = union_muros.convex_hull
+                vacios = envoltura.difference(union_muros)
+                
+                cands = [g for g in (vacios.geoms if hasattr(vacios, 'geoms') else [vacios]) if isinstance(g, Polygon) and g.area > 2.0]
+                hab_principal = max(cands, key=lambda h: h.area) if cands else envoltura
+                area_habitable = round(hab_principal.area, 2)
+
+                # ESCÁNER ROBUSTO DE VANOS + AUTO-ESPESOR
+                vanos_detectados = []
+                coords_per = list(hab_principal.exterior.coords)
+                for i in range(len(coords_per) - 1):
+                    p1, p2 = coords_per[i], coords_per[i+1]
+                    dist = math.hypot(p2[0]-p1[0], p2[1]-p1[1])
+                    if 0.70 <= dist <= 2.80:
+                        pm = Point((p1[0]+p2[0])/2.0, (p1[1]+p2[1])/2.0)
+                        if pm.distance(union_muros) > 0.05:
+                            rot = round(math.degrees(math.atan2(p2[1]-p1[1], p2[0]-p1[0])), 1)
+                            if not any(math.hypot(pm.x - v['cx'], pm.y - v['cy']) < 0.5 for v in vanos_detectados):
+                                
+                                # MAGIA: Calcular el grosor de la pared automáticamente
+                                espesor_real = 0.15
+                                for poly in muros_solidos:
+                                    if poly.distance(pm) < 0.2:
+                                        aprox = poly.area / (poly.length / 2.0)
+                                        estandares = [0.10, 0.15, 0.20, 0.25, 0.30]
+                                        espesor_real = min(estandares, key=lambda x: abs(x - aprox))
+                                        break
+
+                                vanos_detectados.append({
+                                    "tipo": "puerta", "cx": pm.x, "cy": pm.y,
+                                    "p1": {"x": round(p1[0],2), "y": round(p1[1],2)},
+                                    "p2": {"x": round(p2[0],2), "y": round(p2[1],2)},
+                                    "ancho": round(dist, 2), "rot": rot, "espesor": espesor_real
+                                })
+
+            with st.spinner("🪑 Distribuyendo Mobiliario sin Colisiones..."):
+                aforo_legal_max = math.floor(area_habitable / factor_area)
+                mesas_4p, mesas_2p = [], []
+                
+                area_interior = hab_principal.buffer(-1.00) 
+                centro_local = hab_principal.centroid
+                
+                pasillos_geom = [LineString([(v['cx'], v['cy']), (centro_local.x, centro_local.y)]).buffer(pasillo_min / 2.0) for v in vanos_detectados]
+                red_prohibida = unary_union(pasillos_geom)
+
+                if not area_interior.is_empty and area_habitable >= 6.0:
+                    bx1, by1, bx2, by2 = area_interior.bounds
+                    
+                    paso_4p = 2.40 
+                    x_c = bx1 + 0.6
+                    while x_c <= bx2:
+                        y_c = by1 + 0.6
+                        while y_c <= by2:
+                            pt = Point(x_c, y_c)
+                            if area_interior.contains(pt) and not red_prohibida.contains(pt):
+                                if all(math.hypot(x_c - m['x'], y_c - m['y']) >= 2.0 for m in mesas_4p):
+                                    mesas_4p.append({"id": "mesa_4p.skp", "x": round(x_c,2), "y": round(y_c,2), "z": 0.0, "rot": 0, "asientos": 4})
+                            y_c += paso_4p
+                        x_c += paso_4p
+
+                    zonas_ocupadas = [Point(m['x'], m['y']).buffer(1.20) for m in mesas_4p] + pasillos_geom
+                    area_residual = area_interior.difference(unary_union(zonas_ocupadas))
+                    
+                    if not area_residual.is_empty:
+                        paso_2p = 1.40
+                        rx = bx1 + 0.5
+                        while rx <= bx2:
+                            ry = by1 + 0.5
+                            while ry <= by2:
+                                pt_res = Point(rx, ry)
+                                if area_residual.contains(pt_res):
+                                    if all(math.hypot(rx - m['x'], ry - m['y']) >= 1.2 for m in mesas_2p):
+                                        mesas_2p.append({"id": "mesa_2p.skp", "x": round(rx,2), "y": round(ry,2), "z": 0.0, "rot": 0, "asientos": 2})
+                                ry += paso_2p
+                            rx += paso_2p
+
+                asientos_totales = (len(mesas_4p)*4) + (len(mesas_2p)*2)
+                
+                datos_proyecto = {
+                    "altura_muros": 2.80,
+                    "muros": [[{"x": round(x,2), "y": round(y,2)} for x,y in p.exterior.coords] for p in muros_solidos],
+                    "contorno_piso": [{"x": round(x,2), "y": round(y,2)} for x,y in hab_principal.exterior.coords],
+                    "vanos": vanos_detectados,
+                    "muebles": mesas_4p + mesas_2p,
+                    "reporte": {"area_m2": area_habitable, "aforo_legal": aforo_legal_max, "asientos": asientos_totales}
+                }
+                
+                st.session_state['datos_proyecto'] = json.dumps(datos_proyecto, indent=4)
+                st.session_state['metrics'] = {
+                    "area": area_habitable, "legal": aforo_legal_max, "asientos": asientos_totales
+                }
+
+        except Exception as e:
+            st.error(f"❌ Error: {e}")
+        finally:
+            if os.path.exists(ruta_temporal): os.remove(ruta_temporal)
+
+# UI PERSISTENTE
+if st.session_state['datos_proyecto']:
+    m = st.session_state['metrics']
+    col1, col2, col3 = st.columns(3)
+    col1.metric("📐 Área Útil", f"{m['area']} m²")
+    col2.metric("🏛️ Aforo Legal Máx.", f"{m['legal']} Pax")
+    col3.metric("🪑 Asientos Diseñados", f"{m['asientos']} Pax")
+
+    st.download_button("📦 Descargar Modelo.json", data=st.session_state['datos_proyecto'], file_name="proyecto.json")

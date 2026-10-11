@@ -6,7 +6,6 @@ import os
 import math
 from shapely.geometry import LineString, Point, Polygon, MultiPolygon
 from shapely.ops import unary_union, polygonize, snap
-import shapely
 
 st.set_page_config(page_title="Patty | ConTech Engine", page_icon="🏗️", layout="centered")
 st.title("🏗️ Patty - Generador Arquitectónico Paramétrico")
@@ -17,7 +16,7 @@ if 'datos_proyecto' not in st.session_state:
     st.session_state['metrics'] = None
 
 factor_area = 1.50  
-pasillo_min = 1.20  
+pasillo_min = 1.00  # Pasillo optimizado para restaurantes
 
 archivo_dxf = st.file_uploader("📥 Arrastra aquí el plano CAD (.DXF)", type=['dxf'])
 
@@ -53,7 +52,7 @@ if archivo_dxf is not None:
 
                 red_unida = unary_union(snap(unary_union(lineas_limpias), unary_union(lineas_limpias), tolerance=0.10))
                 
-                # CREACIÓN DE MUROS (Con esquinas afiladas profesionales: cap_style=2, join_style=2)
+                # MUROS CON ESQUINAS RECTAS
                 muros_solidos = [p for p in polygonize(red_unida) if p.is_valid and p.buffer(-0.10).is_empty]
                 if not muros_solidos:
                     muro_buffer = red_unida.buffer(0.10, cap_style=2, join_style=2)
@@ -67,9 +66,8 @@ if archivo_dxf is not None:
                 hab_principal = max(cands, key=lambda h: h.area) if cands else envoltura
                 area_habitable = round(hab_principal.area, 2)
 
-                # ESCÁNER DE VANOS POR "RAYCAST"
+                # ESCÁNER DE VANOS (Filtro Estricto para Puertas)
                 vanos_detectados = []
-                # Simplificamos el perímetro para evitar micro-segmentos
                 perimetro_simplificado = hab_principal.simplify(0.05, preserve_topology=True)
                 coords_per = list(perimetro_simplificado.exterior.coords)
                 
@@ -79,9 +77,7 @@ if archivo_dxf is not None:
                     
                     if 0.70 <= dist <= 2.80:
                         segmento = LineString([p1, p2])
-                        # Si más del 80% del segmento está en el aire (no intersecta muros), ES UNA PUERTA
-                        longitud_interseccion = segmento.intersection(union_muros).length
-                        if longitud_interseccion < (dist * 0.20):
+                        if segmento.intersection(union_muros).length < (dist * 0.20):
                             pm = Point((p1[0]+p2[0])/2.0, (p1[1]+p2[1])/2.0)
                             rot = round(math.degrees(math.atan2(p2[1]-p1[1], p2[0]-p1[0])), 1)
                             
@@ -92,45 +88,67 @@ if archivo_dxf is not None:
                                     estandares = [0.10, 0.15, 0.20, 0.25, 0.30]
                                     espesor_real = min(estandares, key=lambda x: abs(x - aprox))
                                     break
+                            
+                            # CLASIFICACIÓN ESTRICTA: Solo las aberturas de tamaño humano generan puertas
+                            tipo_vano = "puerta" if 0.75 <= dist <= 1.25 else "ventana"
 
                             vanos_detectados.append({
-                                "tipo": "puerta", "cx": pm.x, "cy": pm.y,
+                                "tipo": tipo_vano, "cx": pm.x, "cy": pm.y,
                                 "p1": {"x": round(p1[0],2), "y": round(p1[1],2)},
                                 "p2": {"x": round(p2[0],2), "y": round(p2[1],2)},
                                 "ancho": round(dist, 2), "rot": rot, "espesor": espesor_real
                             })
 
-            with st.spinner("🪑 Distribuyendo Mobiliario Arquitectónico..."):
+            with st.spinner("🪑 Maximizando Aforo Comercial..."):
                 aforo_legal_max = math.floor(area_habitable / factor_area)
                 mesas_4p, mesas_2p = [], []
                 
+                area_interior = hab_principal.buffer(-0.85) # Más cerca de los muros para rentabilizar espacio
                 centro_local = hab_principal.centroid
-                pasillos_geom = [LineString([(v['cx'], v['cy']), (centro_local.x, centro_local.y)]).buffer(pasillo_min / 2.0) for v in vanos_detectados]
+                
+                # PASILLOS PROHIBIDOS (SOLO se dibujan desde las PUERTAS REALES, no desde las ventanas)
+                pasillos_geom = []
+                for v in vanos_detectados:
+                    if v['tipo'] == 'puerta':
+                        linea_pasillo = LineString([(v['cx'], v['cy']), (centro_local.x, centro_local.y)])
+                        pasillos_geom.append(linea_pasillo.buffer(pasillo_min / 2.0))
                 red_prohibida = unary_union(pasillos_geom)
 
                 if area_habitable >= 6.0:
                     bx1, by1, bx2, by2 = hab_principal.bounds
                     
-                    paso = 2.20 
-                    x_c = bx1 + 1.0
+                    # PASADA 1: MESAS DE 4 (Grilla Agresiva)
+                    paso = 1.90 
+                    x_c = bx1 + 0.5
                     while x_c <= bx2:
-                        y_c = by1 + 1.0
+                        y_c = by1 + 0.5
                         while y_c <= by2:
                             pt = Point(x_c, y_c)
                             
                             if hab_principal.contains(pt) and not red_prohibida.contains(pt):
                                 dist_muro = pt.distance(union_muros)
-                                dist_pasillo = pt.distance(red_prohibida) if not red_prohibida.is_empty else 99.0
                                 
-                                # Acomodo orgánico: las mesas de 4 en áreas libres, las de 2 cerca a paredes o vacíos
-                                if dist_muro >= 1.00 and dist_pasillo >= 0.80:
+                                # Si hay espacio suficiente al muro y a otras mesas, poner 4p
+                                if dist_muro >= 0.85 and all(math.hypot(x_c - m['x'], y_c - m['y']) >= 1.80 for m in mesas_4p):
                                     mesas_4p.append({"id": "mesa_4p.skp", "x": round(x_c,2), "y": round(y_c,2), "z": 0.0, "rot": 0, "asientos": 4})
-                                elif dist_muro >= 0.70 and dist_pasillo >= 0.40:
-                                    # Gira la mesa de 2 personas para que se acomode contra el muro
-                                    mesas_2p.append({"id": "mesa_2p.skp", "x": round(x_c,2), "y": round(y_c,2), "z": 0.0, "rot": 90, "asientos": 2})
-                                    
                             y_c += paso
                         x_c += paso
+
+                    # PASADA 2: RELLENO MESAS DE 2 (Grilla Desfasada)
+                    paso2 = 1.40
+                    rx = bx1 + 0.5
+                    while rx <= bx2:
+                        ry = by1 + 0.5
+                        while ry <= by2:
+                            pt_res = Point(rx, ry)
+                            if area_interior.contains(pt_res) and not red_prohibida.contains(pt_res):
+                                libre_4p = all(math.hypot(rx - m['x'], ry - m['y']) >= 1.60 for m in mesas_4p)
+                                libre_2p = all(math.hypot(rx - m['x'], ry - m['y']) >= 1.30 for m in mesas_2p)
+                                if libre_4p and libre_2p:
+                                    # Las mesas de 2 se giran para pegarse bien a la pared
+                                    mesas_2p.append({"id": "mesa_2p.skp", "x": round(rx,2), "y": round(ry,2), "z": 0.0, "rot": 90, "asientos": 2})
+                            ry += paso2
+                        rx += paso2
 
                 asientos_totales = (len(mesas_4p)*4) + (len(mesas_2p)*2)
                 

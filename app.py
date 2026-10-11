@@ -11,14 +11,12 @@ st.set_page_config(page_title="Patty | ConTech Engine", page_icon="🏗️", lay
 st.title("🏗️ Patty - Generador Arquitectónico Paramétrico")
 st.markdown("---")
 
-# MANTENER EL ESTADO DE LA UI
 if 'datos_proyecto' not in st.session_state:
     st.session_state['datos_proyecto'] = None
     st.session_state['metrics'] = None
 
-# PARÁMETROS UNIVERSALES (Cero inputs del usuario)
-factor_area = 1.50  # Estándar comercial internacional
-pasillo_min = 1.20  # Estándar de evacuación seguro
+factor_area = 1.50  
+pasillo_min = 1.20  
 
 archivo_dxf = st.file_uploader("📥 Arrastra aquí el plano CAD (.DXF)", type=['dxf'])
 
@@ -65,7 +63,7 @@ if archivo_dxf is not None:
                 hab_principal = max(cands, key=lambda h: h.area) if cands else envoltura
                 area_habitable = round(hab_principal.area, 2)
 
-                # ESCÁNER ROBUSTO DE VANOS + AUTO-ESPESOR
+                # ESCÁNER DE VANOS
                 vanos_detectados = []
                 coords_per = list(hab_principal.exterior.coords)
                 for i in range(len(coords_per) - 1):
@@ -77,7 +75,6 @@ if archivo_dxf is not None:
                             rot = round(math.degrees(math.atan2(p2[1]-p1[1], p2[0]-p1[0])), 1)
                             if not any(math.hypot(pm.x - v['cx'], pm.y - v['cy']) < 0.5 for v in vanos_detectados):
                                 
-                                # MAGIA: Calcular el grosor de la pared automáticamente
                                 espesor_real = 0.15
                                 for poly in muros_solidos:
                                     if poly.distance(pm) < 0.2:
@@ -106,14 +103,14 @@ if archivo_dxf is not None:
                 if not area_interior.is_empty and area_habitable >= 6.0:
                     bx1, by1, bx2, by2 = area_interior.bounds
                     
-                    paso_4p = 2.40 
+                    paso_4p = 2.50 
                     x_c = bx1 + 0.6
                     while x_c <= bx2:
                         y_c = by1 + 0.6
                         while y_c <= by2:
                             pt = Point(x_c, y_c)
                             if area_interior.contains(pt) and not red_prohibida.contains(pt):
-                                if all(math.hypot(x_c - m['x'], y_c - m['y']) >= 2.0 for m in mesas_4p):
+                                if all(math.hypot(x_c - m['x'], y_c - m['y']) >= 2.2 for m in mesas_4p):
                                     mesas_4p.append({"id": "mesa_4p.skp", "x": round(x_c,2), "y": round(y_c,2), "z": 0.0, "rot": 0, "asientos": 4})
                             y_c += paso_4p
                         x_c += paso_4p
@@ -122,14 +119,15 @@ if archivo_dxf is not None:
                     area_residual = area_interior.difference(unary_union(zonas_ocupadas))
                     
                     if not area_residual.is_empty:
-                        paso_2p = 1.40
+                        paso_2p = 1.80
                         rx = bx1 + 0.5
                         while rx <= bx2:
                             ry = by1 + 0.5
                             while ry <= by2:
                                 pt_res = Point(rx, ry)
                                 if area_residual.contains(pt_res):
-                                    if all(math.hypot(rx - m['x'], ry - m['y']) >= 1.2 for m in mesas_2p):
+                                    # RADAR AMPLIADO: 1.60m mínimo de separación
+                                    if all(math.hypot(rx - m['x'], ry - m['y']) >= 1.6 for m in mesas_2p):
                                         mesas_2p.append({"id": "mesa_2p.skp", "x": round(rx,2), "y": round(ry,2), "z": 0.0, "rot": 0, "asientos": 2})
                                 ry += paso_2p
                             rx += paso_2p
@@ -155,7 +153,6 @@ if archivo_dxf is not None:
         finally:
             if os.path.exists(ruta_temporal): os.remove(ruta_temporal)
 
-# UI PERSISTENTE
 if st.session_state['datos_proyecto']:
     m = st.session_state['metrics']
     col1, col2, col3 = st.columns(3)

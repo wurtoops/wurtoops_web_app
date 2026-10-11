@@ -16,7 +16,7 @@ if 'datos_proyecto' not in st.session_state:
     st.session_state['metrics'] = None
 
 factor_area = 1.50  
-pasillo_min = 1.00  # Pasillo optimizado para restaurantes
+pasillo_min = 1.20  
 
 archivo_dxf = st.file_uploader("📥 Arrastra aquí el plano CAD (.DXF)", type=['dxf'])
 
@@ -52,7 +52,6 @@ if archivo_dxf is not None:
 
                 red_unida = unary_union(snap(unary_union(lineas_limpias), unary_union(lineas_limpias), tolerance=0.10))
                 
-                # MUROS CON ESQUINAS RECTAS
                 muros_solidos = [p for p in polygonize(red_unida) if p.is_valid and p.buffer(-0.10).is_empty]
                 if not muros_solidos:
                     muro_buffer = red_unida.buffer(0.10, cap_style=2, join_style=2)
@@ -66,7 +65,7 @@ if archivo_dxf is not None:
                 hab_principal = max(cands, key=lambda h: h.area) if cands else envoltura
                 area_habitable = round(hab_principal.area, 2)
 
-                # ESCÁNER DE VANOS (Filtro Estricto para Puertas)
+                # ESCÁNER DE VANOS (Filtro estricto restaurado)
                 vanos_detectados = []
                 perimetro_simplificado = hab_principal.simplify(0.05, preserve_topology=True)
                 coords_per = list(perimetro_simplificado.exterior.coords)
@@ -89,8 +88,8 @@ if archivo_dxf is not None:
                                     espesor_real = min(estandares, key=lambda x: abs(x - aprox))
                                     break
                             
-                            # CLASIFICACIÓN ESTRICTA: Solo las aberturas de tamaño humano generan puertas
-                            tipo_vano = "puerta" if 0.75 <= dist <= 1.25 else "ventana"
+                            # CLASIFICACIÓN VITAL: Si mide más de 1.30m, NO es puerta. 
+                            tipo_vano = "puerta" if 0.75 <= dist <= 1.30 else "ventana"
 
                             vanos_detectados.append({
                                 "tipo": tipo_vano, "cx": pm.x, "cy": pm.y,
@@ -99,14 +98,14 @@ if archivo_dxf is not None:
                                 "ancho": round(dist, 2), "rot": rot, "espesor": espesor_real
                             })
 
-            with st.spinner("🪑 Maximizando Aforo Comercial..."):
+            with st.spinner("🪑 Maximizando Aforo con Circulación Segura..."):
                 aforo_legal_max = math.floor(area_habitable / factor_area)
                 mesas_4p, mesas_2p = [], []
                 
-                area_interior = hab_principal.buffer(-0.85) # Más cerca de los muros para rentabilizar espacio
+                area_interior = hab_principal.buffer(-0.95) # Distancia prudente a la pared
                 centro_local = hab_principal.centroid
                 
-                # PASILLOS PROHIBIDOS (SOLO se dibujan desde las PUERTAS REALES, no desde las ventanas)
+                # SOLO las puertas generan pasillo. El hueco ancho arriba ya no bloqueará el salón.
                 pasillos_geom = []
                 for v in vanos_detectados:
                     if v['tipo'] == 'puerta':
@@ -117,38 +116,35 @@ if archivo_dxf is not None:
                 if area_habitable >= 6.0:
                     bx1, by1, bx2, by2 = hab_principal.bounds
                     
-                    # PASADA 1: MESAS DE 4 (Grilla Agresiva)
-                    paso = 1.90 
-                    x_c = bx1 + 0.5
+                    # PASADA 1: MESAS DE 4 (Cuadrícula Holgada = 2.20m)
+                    paso_4p = 2.20 
+                    x_c = bx1 + 1.0
                     while x_c <= bx2:
-                        y_c = by1 + 0.5
+                        y_c = by1 + 1.0
                         while y_c <= by2:
                             pt = Point(x_c, y_c)
                             
-                            if hab_principal.contains(pt) and not red_prohibida.contains(pt):
-                                dist_muro = pt.distance(union_muros)
-                                
-                                # Si hay espacio suficiente al muro y a otras mesas, poner 4p
-                                if dist_muro >= 0.85 and all(math.hypot(x_c - m['x'], y_c - m['y']) >= 1.80 for m in mesas_4p):
+                            if area_interior.contains(pt) and not red_prohibida.contains(pt):
+                                # Asegurar 2.10m entre centros de mesas para sillas "abiertas"
+                                if all(math.hypot(x_c - m['x'], y_c - m['y']) >= 2.10 for m in mesas_4p):
                                     mesas_4p.append({"id": "mesa_4p.skp", "x": round(x_c,2), "y": round(y_c,2), "z": 0.0, "rot": 0, "asientos": 4})
-                            y_c += paso
-                        x_c += paso
+                            y_c += paso_4p
+                        x_c += paso_4p
 
-                    # PASADA 2: RELLENO MESAS DE 2 (Grilla Desfasada)
-                    paso2 = 1.40
-                    rx = bx1 + 0.5
+                    # PASADA 2: MESAS DE 2 (Relleno sin chocar)
+                    paso_2p = 1.40
+                    rx = bx1 + 0.6
                     while rx <= bx2:
-                        ry = by1 + 0.5
+                        ry = by1 + 0.6
                         while ry <= by2:
                             pt_res = Point(rx, ry)
                             if area_interior.contains(pt_res) and not red_prohibida.contains(pt_res):
-                                libre_4p = all(math.hypot(rx - m['x'], ry - m['y']) >= 1.60 for m in mesas_4p)
-                                libre_2p = all(math.hypot(rx - m['x'], ry - m['y']) >= 1.30 for m in mesas_2p)
+                                libre_4p = all(math.hypot(rx - m['x'], ry - m['y']) >= 1.75 for m in mesas_4p)
+                                libre_2p = all(math.hypot(rx - m['x'], ry - m['y']) >= 1.40 for m in mesas_2p)
                                 if libre_4p and libre_2p:
-                                    # Las mesas de 2 se giran para pegarse bien a la pared
                                     mesas_2p.append({"id": "mesa_2p.skp", "x": round(rx,2), "y": round(ry,2), "z": 0.0, "rot": 90, "asientos": 2})
-                            ry += paso2
-                        rx += paso2
+                            ry += paso_2p
+                        rx += paso_2p
 
                 asientos_totales = (len(mesas_4p)*4) + (len(mesas_2p)*2)
                 

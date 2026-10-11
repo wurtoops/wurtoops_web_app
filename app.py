@@ -52,7 +52,11 @@ if archivo_dxf is not None:
 
             with st.spinner("🧹 2/3 Extrayendo muros y escaneando vanos..."):
                 red_unida = unary_union(snap(unary_union(lineas_limpias), unary_union(lineas_limpias), tolerance=0.10))
-                muros_solidos = [p for p in polygonize(red_unida) if not p.buffer(-0.15).is_empty]
+                
+                # BUG SOLUCIONADO AQUÍ: Sin el 'not'. (Si desaparece al encogerse, es un muro delgado)
+                poligonos_cerrados = list(polygonize(red_unida))
+                muros_solidos = [p for p in poligonos_cerrados if p.is_valid and p.buffer(-0.15).is_empty]
+                
                 if not muros_solidos:
                     muro_buffer = red_unida.buffer(0.10)
                     muros_solidos = list(muro_buffer.geoms) if isinstance(muro_buffer, MultiPolygon) else [muro_buffer]
@@ -65,7 +69,7 @@ if archivo_dxf is not None:
                 hab_principal = max(cands, key=lambda h: h.area) if cands else envoltura
                 area_habitable = round(hab_principal.area, 2)
 
-                # NUEVO ESCÁNER DE VANOS (Cero Fallas: Recorre el perímetro y busca huecos)
+                # ESCÁNER DE VANOS (Perímetro vs Concreto)
                 vanos_detectados = []
                 coords_per = list(hab_principal.exterior.coords)
                 
@@ -74,11 +78,10 @@ if archivo_dxf is not None:
                     dist = math.hypot(p2[0]-p1[0], p2[1]-p1[1])
                     
                     if 0.70 <= dist <= 2.80:
-                        # Si el centro de esta línea está en el aire (separado del concreto), es una puerta
                         pm = Point((p1[0]+p2[0])/2.0, (p1[1]+p2[1])/2.0)
+                        # Si la línea está en el aire (no choca con concreto), es un vano real
                         if pm.distance(union_muros) > 0.05:
                             rot = round(math.degrees(math.atan2(p2[1]-p1[1], p2[0]-p1[0])), 1)
-                            # Prevenir duplicados en la misma zona
                             if not any(math.hypot(pm.x - v['cx'], pm.y - v['cy']) < 0.5 for v in vanos_detectados):
                                 vanos_detectados.append({
                                     "tipo": "puerta" if dist <= 1.30 else "ventana",
@@ -105,7 +108,6 @@ if archivo_dxf is not None:
                 if not area_interior.is_empty and area_habitable >= 6.0:
                     bx1, by1, bx2, by2 = area_interior.bounds
                     
-                    # PASADA 1: Mesas de 4p
                     paso_4p = 2.40 
                     x_c = bx1 + 0.6
                     while x_c <= bx2:
@@ -118,7 +120,6 @@ if archivo_dxf is not None:
                             y_c += paso_4p
                         x_c += paso_4p
 
-                    # PASADA 2: Relleno con 2p
                     zonas_ocupadas = [Point(m['x'], m['y']).buffer(1.20) for m in mesas_4p] + pasillos_geom
                     area_residual = area_interior.difference(unary_union(zonas_ocupadas))
                     
@@ -150,8 +151,8 @@ if archivo_dxf is not None:
                 col1, col2, col3, col4 = st.columns(4)
                 col1.metric("📐 Área Útil", f"{area_habitable} m²")
                 col2.metric("🏛️ Límite Legal", f"{aforo_legal_max} Pax")
-                col3.metric("🪑 Asientos (Mobiliario)", f"{asientos_totales} Pax")
-                col4.metric("⚖️ Estado", "APROBADO" if cumple_norma else "ALERTA", delta_color="normal" if cumple_norma else "inverse")
+                col3.metric("🪑 Asientos", f"{asientos_totales} Pax")
+                col4.metric("⚖️ Estado", "APROBADO" if cumple_norma else "ALERTA")
 
                 st.download_button("📦 Descargar JSON", data=json.dumps(datos_proyecto, indent=4), file_name="proyecto.json")
 

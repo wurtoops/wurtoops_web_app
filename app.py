@@ -41,7 +41,8 @@ if archivo_dxf is not None:
             
         with st.spinner("⏳ Analizando estructura del archivo pesado..."):
             try:
-                doc, auditor = ezdxf.recover.readfile(st.session_state['archivo_path'])
+                # Lectura estándar (sin recover)
+                doc = ezdxf.readfile(st.session_state['archivo_path'])
                 msp = doc.modelspace()
                 capas = set()
                 for e in msp.query('LINE LWPOLYLINE'):
@@ -70,11 +71,13 @@ if archivo_dxf is not None:
                 
             try:
                 with st.spinner("🧠 Filtrando ruido y procesando 3D..."):
-                    doc, auditor = ezdxf.recover.readfile(st.session_state['archivo_path'])
+                    # Volvemos a abrir el documento solo cuando damos clic a generar
+                    doc = ezdxf.readfile(st.session_state['archivo_path'])
                     msp = doc.modelspace()
                     
                     muros_crudos = []
                     for e in msp.query('LINE LWPOLYLINE'):
+                        # FILTRO: Solo procesar líneas de las capas seleccionadas
                         if e.dxf.layer in capas_seleccionadas:
                             if e.dxftype() == 'LINE':
                                 p1, p2 = (e.dxf.start.x, e.dxf.start.y), (e.dxf.end.x, e.dxf.end.y)
@@ -120,7 +123,7 @@ if archivo_dxf is not None:
                     hab_limpia = hab_principal.simplify(0.05, preserve_topology=True)
                     area_habitable = round(hab_limpia.area, 2)
 
-                    # ESCÁNER DE VANOS (Con Láser Raycast)
+                    # ESCÁNER DE VANOS
                     vanos_detectados = []
                     coords_per = list(hab_limpia.exterior.coords)
                     
@@ -175,7 +178,6 @@ if archivo_dxf is not None:
                     if area_habitable >= 6.0 and not area_interior.is_empty:
                         bx1, by1, bx2, by2 = hab_limpia.bounds
                         
-                        # MESAS DE 4 PERSONAS (Holgura Comercial: 1.90m)
                         paso_4p = 1.90 
                         x_c = bx1 + 0.4
                         while x_c <= bx2:
@@ -188,7 +190,6 @@ if archivo_dxf is not None:
                                 y_c += paso_4p
                             x_c += paso_4p
 
-                        # MESAS DE 2 PERSONAS
                         paso_2p = 1.30
                         rx = bx1 + 0.4
                         while rx <= bx2:

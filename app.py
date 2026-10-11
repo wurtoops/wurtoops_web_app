@@ -74,7 +74,6 @@ if archivo_dxf is not None:
                         if pm.distance(union_muros) > 0.05:
                             rot = round(math.degrees(math.atan2(p2[1]-p1[1], p2[0]-p1[0])), 1)
                             if not any(math.hypot(pm.x - v['cx'], pm.y - v['cy']) < 0.5 for v in vanos_detectados):
-                                
                                 espesor_real = 0.15
                                 for poly in muros_solidos:
                                     if poly.distance(pm) < 0.2:
@@ -90,47 +89,40 @@ if archivo_dxf is not None:
                                     "ancho": round(dist, 2), "rot": rot, "espesor": espesor_real
                                 })
 
-            with st.spinner("🪑 Distribuyendo Mobiliario sin Colisiones..."):
+            with st.spinner("🪑 Distribuyendo Mobiliario en Cuadrícula Unificada..."):
                 aforo_legal_max = math.floor(area_habitable / factor_area)
                 mesas_4p, mesas_2p = [], []
                 
-                area_interior = hab_principal.buffer(-1.00) 
                 centro_local = hab_principal.centroid
-                
                 pasillos_geom = [LineString([(v['cx'], v['cy']), (centro_local.x, centro_local.y)]).buffer(pasillo_min / 2.0) for v in vanos_detectados]
                 red_prohibida = unary_union(pasillos_geom)
 
-                if not area_interior.is_empty and area_habitable >= 6.0:
-                    bx1, by1, bx2, by2 = area_interior.bounds
+                if area_habitable >= 6.0:
+                    bx1, by1, bx2, by2 = hab_principal.bounds
                     
-                    paso_4p = 2.50 
-                    x_c = bx1 + 0.6
+                    # CUADRÍCULA MAESTRA UNIFICADA (Evita el desorden)
+                    paso = 2.20 
+                    x_c = bx1 + 1.0
                     while x_c <= bx2:
-                        y_c = by1 + 0.6
+                        y_c = by1 + 1.0
                         while y_c <= by2:
                             pt = Point(x_c, y_c)
-                            if area_interior.contains(pt) and not red_prohibida.contains(pt):
-                                if all(math.hypot(x_c - m['x'], y_c - m['y']) >= 2.2 for m in mesas_4p):
+                            
+                            # Validar que esté dentro de la habitación y no en el pasillo de evacuación
+                            if hab_principal.contains(pt) and not red_prohibida.contains(pt):
+                                dist_muro = pt.distance(union_muros)
+                                dist_pasillo = pt.distance(red_prohibida) if not red_prohibida.is_empty else 99.0
+                                
+                                # Prioridad 1: Intenta poner Mesa de 4p (Requiere 1.1m a paredes y 0.8m a pasillos)
+                                if dist_muro >= 1.10 and dist_pasillo >= 0.80:
                                     mesas_4p.append({"id": "mesa_4p.skp", "x": round(x_c,2), "y": round(y_c,2), "z": 0.0, "rot": 0, "asientos": 4})
-                            y_c += paso_4p
-                        x_c += paso_4p
-
-                    zonas_ocupadas = [Point(m['x'], m['y']).buffer(1.20) for m in mesas_4p] + pasillos_geom
-                    area_residual = area_interior.difference(unary_union(zonas_ocupadas))
-                    
-                    if not area_residual.is_empty:
-                        paso_2p = 1.80
-                        rx = bx1 + 0.5
-                        while rx <= bx2:
-                            ry = by1 + 0.5
-                            while ry <= by2:
-                                pt_res = Point(rx, ry)
-                                if area_residual.contains(pt_res):
-                                    # RADAR AMPLIADO: 1.60m mínimo de separación
-                                    if all(math.hypot(rx - m['x'], ry - m['y']) >= 1.6 for m in mesas_2p):
-                                        mesas_2p.append({"id": "mesa_2p.skp", "x": round(rx,2), "y": round(ry,2), "z": 0.0, "rot": 0, "asientos": 2})
-                                ry += paso_2p
-                            rx += paso_2p
+                                
+                                # Prioridad 2: Si no cabe de 4, pone Mesa de 2p EN EL MISMO EJE EXACTO
+                                elif dist_muro >= 0.85 and dist_pasillo >= 0.50:
+                                    mesas_2p.append({"id": "mesa_2p.skp", "x": round(x_c,2), "y": round(y_c,2), "z": 0.0, "rot": 0, "asientos": 2})
+                                    
+                            y_c += paso
+                        x_c += paso
 
                 asientos_totales = (len(mesas_4p)*4) + (len(mesas_2p)*2)
                 
@@ -153,6 +145,7 @@ if archivo_dxf is not None:
         finally:
             if os.path.exists(ruta_temporal): os.remove(ruta_temporal)
 
+# UI PERSISTENTE
 if st.session_state['datos_proyecto']:
     m = st.session_state['metrics']
     col1, col2, col3 = st.columns(3)
@@ -160,4 +153,4 @@ if st.session_state['datos_proyecto']:
     col2.metric("🏛️ Aforo Legal Máx.", f"{m['legal']} Pax")
     col3.metric("🪑 Asientos Diseñados", f"{m['asientos']} Pax")
 
-    st.download_button("📦 Descargar Modelo.json", data=st.session_state['datos_proyecto'], file_name="proyecto.json")
+    st.download_button("📦 Descargar JSON de Patty", data=st.session_state['datos_proyecto'], file_name="proyecto.json")

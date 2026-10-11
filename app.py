@@ -1,161 +1,160 @@
-require 'json'
+import streamlit as st
+import ezdxf
+import json
+import tempfile
+import os
+import math
+from shapely.geometry import LineString, Point, Polygon, MultiPolygon, GeometryCollection
+from shapely.ops import unary_union, polygonize, snap
 
-module PattyEngine
-  def self.construir
-    model = Sketchup.active_model
-    path = UI.openpanel("Seleccionar JSON Patty v2.4", "", "JSON|*.json;||")
-    return unless path && File.exist?(path)
-    
-    dir = File.dirname(path)
-    data = JSON.parse(File.read(path))
-    
-    model.start_operation("Patty v2.4", true)
-    begin
-      model.entities.erase_entities(model.entities.to_a)
-      model.definitions.purge_unused
-      
-      ly_muros = model.layers.add("PATTY_MUROS")
-      ly_piso = model.layers.add("PATTY_PISOS")
-      ly_vanos = model.layers.add("PATTY_VANOS")
-      ly_muebles = model.layers.add("PATTY_MUEBLES")
-      
-      h_muro = (data['altura_muros'] || 2.8).to_f.m
-      
-      # 1. MUROS
-      g_muros = model.entities.add_group
-      g_muros.layer = ly_muros
-      data['muros'].each do |pts|
-        limpios = sanear(pts)
-        next if limpios.size < 3
-        face = g_muros.entities.add_face(limpios)
-        if face
-          face.reverse! if face.normal.z < 0
-          face.pushpull(h_muro)
-        end
-      end
-      
-      # 2. PISO
-      if data['contorno_piso']
-        g_piso = model.entities.add_group
-        g_piso.layer = ly_piso
-        face = g_piso.entities.add_face(sanear(data['contorno_piso']))
-        if face
-          face.reverse! if face.normal.z < 0
-          face.pushpull(-0.05.m)
-        end
-      end
-      
-      # 3. VANOS, DINTELES Y PUERTAS
-      g_vanos = model.entities.add_group
-      g_vanos.layer = ly_vanos
-      (data['vanos'] || []).each do |v|
-        p1 = Geom::Point3d.new(v['p1']['x'].to_f.m, v['p1']['y'].to_f.m, 0)
-        p2 = Geom::Point3d.new(v['p2']['x'].to_f.m, v['p2']['y'].to_f.m, 0)
-        
-        dx, dy = p2.x - p1.x, p2.y - p1.y
-        len = Math.hypot(dx, dy)
-        next if len < 0.3.m
-        
-        nx, ny = -dy/len, dx/len
-        off_x, off_y = nx * 0.10.m, ny * 0.10.m
-        
-        # Dintel
-        h_d = h_muro - 2.10.m
-        pts_d = [
-          Geom::Point3d.new(p1.x+off_x, p1.y+off_y, 2.1.m),
-          Geom::Point3d.new(p2.x+off_x, p2.y+off_y, 2.1.m),
-          Geom::Point3d.new(p2.x-off_x, p2.y-off_y, 2.1.m),
-          Geom::Point3d.new(p1.x-off_x, p1.y-off_y, 2.1.m)
-        ]
-        face_d = g_vanos.entities.add_face(pts_d)
-        if face_d
-          face_d.reverse! if face_d.normal.z < 0
-          face_d.pushpull(h_d)
-        end
-        
-        # Puerta (Anclada en P1 para usar la bisagra de tu modelo)
-        if v['tipo'] == 'puerta'
-          skp = File.join(dir, "puerta.skp")
-          tr_rot = Geom::Transformation.rotation(Geom::Point3d.new(0,0,0), Geom::Vector3d.new(0,0,1), v['rot'].to_f.degrees)
-          tr_pos = Geom::Transformation.translation(Geom::Vector3d.new(p1.x, p1.y, 0))
-          tr_final = tr_pos * tr_rot
-          
-          if File.exist?(skp)
-            inst = g_vanos.entities.add_instance(model.definitions.load(skp), tr_final)
-            min_z = inst.bounds.min.z
-            if min_z.abs > 0.01.m
-              inst.transform!(Geom::Transformation.translation(Geom::Vector3d.new(0, 0, -min_z)))
-            end
-          else
-            # ALERTA: Si no encuentra el archivo, dibuja un proxy para que sepas que el motor funciona
-            puts "[Patty] ALERTA: No se encontró puerta.skp en la carpeta #{dir}"
-            crear_proxy_puerta(g_vanos.entities, tr_final, len)
-          end
-        end
-      end
-      
-      # 4. MUEBLES
-      g_muebles = model.entities.add_group
-      g_muebles.layer = ly_muebles
-      (data['muebles'] || []).each do |m|
-        skp = File.join(dir, m['id'])
-        tr_pos = Geom::Transformation.translation(Geom::Vector3d.new(m['x'].to_f.m, m['y'].to_f.m, 0))
-        
-        if File.exist?(skp)
-          inst = g_muebles.entities.add_instance(model.definitions.load(skp), tr_pos)
-          min_z = inst.bounds.min.z
-          if min_z.abs > 0.01.m
-            inst.transform!(Geom::Transformation.translation(Geom::Vector3d.new(0, 0, -min_z)))
-          end
-        else
-          radio = m['tipo'] == 'mesa_4p' ? 0.50.m : 0.35.m
-          crear_mesa_proxy(g_muebles.entities, Geom::Point3d.new(m['x'].to_f.m, m['y'].to_f.m, 0), radio)
-        end
-      end
-      
-      model.commit_operation
-      model.active_view.zoom_extents
-    rescue => e
-      model.abort_operation
-      UI.messagebox("Error: #{e.message}")
-    end
-  end
+st.set_page_config(page_title="Patty | ConTech Engine", page_icon="🏗️", layout="wide")
+st.title("🏗️ Patty - Generador Arquitectónico Paramétrico")
+st.markdown("---")
 
-  def self.sanear(pts)
-    raw = pts.map { |p| Geom::Point3d.new(p['x'].to_f.m, p['y'].to_f.m, 0) }
-    unq = []
-    raw.each { |p| unq << p if unq.empty? || unq.last.distance(p) > 0.005.m }
-    unq.pop if unq.size > 1 && unq.first.distance(unq.last) < 0.005.m
-    unq
-  end
+st.sidebar.header("🏛️ Parámetros de Cumplimiento")
+normativa_sel = st.sidebar.selectbox("Normativa Aplicable", ["LatAm - RNE", "EE.UU. - IBC", "España - CTE"])
+tipo_local = st.sidebar.selectbox("Giro / Uso", ["Restaurante Comercial", "Cafetería / Bistro"])
 
-  # Función de Proxy en caso de que falte el archivo puerta.skp
-  def self.crear_proxy_puerta(entities, tr_final, ancho)
-    grp = entities.add_group
-    pts = [
-      Geom::Point3d.new(0, 0, 0),
-      Geom::Point3d.new(ancho, 0, 0),
-      Geom::Point3d.new(ancho, 0.05.m, 0),
-      Geom::Point3d.new(0, 0.05.m, 0)
-    ]
-    face = grp.entities.add_face(pts)
-    face.pushpull(2.10.m) if face
-    grp.transform!(tr_final)
-  end
+factor_area = 1.50 if "Restaurante" in tipo_local else 1.20
+pasillo_min = 1.20 if "RNE" in normativa_sel else 1.00
 
-  def self.crear_mesa_proxy(entities, centro, radio)
-    grp = entities.add_group
-    lados = 16
-    pts = (0...lados).map do |i|
-      ang = i * (2.0 * Math::PI / lados)
-      Geom::Point3d.new(centro.x + radio * Math.cos(ang), centro.y + radio * Math.sin(ang), 0)
-    end
-    face = grp.entities.add_face(pts)
-    if face
-      face.reverse! if face.normal.z < 0
-      face.pushpull(0.75.m)
-    end
-  end
-end
+archivo_dxf = st.file_uploader("📥 Arrastra aquí el plano CAD (.DXF)", type=['dxf'])
 
-PattyEngine.construir
+if archivo_dxf is not None:
+    if st.button("🚀 Procesar Plano y Generar Espacio 3D"):
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".dxf") as tmp_file:
+            tmp_file.write(archivo_dxf.getvalue())
+            ruta_temporal = tmp_file.name
+
+        try:
+            with st.spinner("🧠 1/3 Analizando geometría..."):
+                doc = ezdxf.readfile(ruta_temporal)
+                msp = doc.modelspace()
+                muros_crudos = []
+                for e in msp.query('LINE LWPOLYLINE'):
+                    if e.dxftype() == 'LINE':
+                        p1, p2 = (e.dxf.start.x, e.dxf.start.y), (e.dxf.end.x, e.dxf.end.y)
+                        if p1 != p2: muros_crudos.append({"x1": p1[0], "y1": p1[1], "x2": p2[0], "y2": p2[1]})
+                    elif e.dxftype() == 'LWPOLYLINE':
+                        pts = [(float(p[0]), float(p[1])) for p in e.get_points('xy')]
+                        for i in range(len(pts) - 1):
+                            if pts[i] != pts[i+1]: muros_crudos.append({"x1": pts[i][0], "y1": pts[i][1], "x2": pts[i+1][0], "y2": pts[i+1][1]})
+                        if getattr(e, 'is_closed', False) and pts[-1] != pts[0]:
+                            muros_crudos.append({"x1": pts[-1][0], "y1": pts[-1][1], "x2": pts[0][0], "y2": pts[0][1]})
+
+                todos_x = [m['x1'] for m in muros_crudos] + [m['x2'] for m in muros_crudos]
+                todos_y = [m['y1'] for m in muros_crudos] + [m['y2'] for m in muros_crudos]
+                min_x, min_y = min(todos_x), min(todos_y)
+                dim_mayor = max(max(todos_x) - min_x, max(todos_y) - min_y)
+                factor = 1.0 if dim_mayor < 200 else (100.0 if dim_mayor < 25000 else 1000.0)
+
+                lineas_limpias = [LineString([((m['x1']-min_x)/factor, (m['y1']-min_y)/factor), ((m['x2']-min_x)/factor, (m['y2']-min_y)/factor)]) for m in muros_crudos if m['x1']!=m['x2'] or m['y1']!=m['y2']]
+
+            with st.spinner("🧹 2/3 Extrayendo muros y vanos arquitectónicos..."):
+                red_unida = unary_union(snap(unary_union(lineas_limpias), unary_union(lineas_limpias), tolerance=0.10))
+                muros_solidos = [p for p in polygonize(red_unida) if not p.buffer(-0.15).is_empty]
+                if not muros_solidos:
+                    muro_buffer = red_unida.buffer(0.10)
+                    muros_solidos = list(muro_buffer.geoms) if isinstance(muro_buffer, MultiPolygon) else [muro_buffer]
+
+                envoltura = unary_union(muros_solidos).convex_hull
+                vacios = envoltura.difference(unary_union(muros_solidos))
+                cands = [g for g in (vacios.geoms if hasattr(vacios, 'geoms') else [vacios]) if isinstance(g, Polygon) and g.area > 2.0]
+                hab_principal = max(cands, key=lambda h: h.area) if cands else envoltura
+                area_habitable = round(hab_principal.area, 2)
+
+                # DETECTOR RESTAURADO (Detecta huecos libres entre muros distintos)
+                vanos_detectados = []
+                extremos_por_muro = [list(poly.exterior.coords) for poly in muros_solidos]
+                
+                for i in range(len(muros_solidos)):
+                    for j in range(i + 1, len(muros_solidos)):
+                        for pa in extremos_por_muro[i]:
+                            for pb in extremos_por_muro[j]:
+                                dist = math.hypot(pb[0]-pa[0], pb[1]-pa[1])
+                                if 0.70 <= dist <= 2.50:
+                                    pm = Point((pa[0]+pb[0])/2, (pa[1]+pb[1])/2)
+                                    if hab_principal.distance(pm) < 0.5:
+                                        if not any(math.hypot(pm.x - v['cx'], pm.y - v['cy']) < 0.5 for v in vanos_detectados):
+                                            rot = round(math.degrees(math.atan2(pb[1]-pa[1], pb[0]-pa[0])), 1)
+                                            vanos_detectados.append({
+                                                "tipo": "puerta" if dist <= 1.30 else "ventana",
+                                                "cx": pm.x, "cy": pm.y,
+                                                "p1": {"x": round(pa[0],2), "y": round(pa[1],2)},
+                                                "p2": {"x": round(pb[0],2), "y": round(pb[1],2)},
+                                                "ancho": round(dist, 2), "rot": rot
+                                            })
+
+            with st.spinner("🪑 3/3 Ejecutando Algoritmo de Circulación y Aforo..."):
+                aforo_legal_max = math.floor(area_habitable / factor_area)
+                mesas_4p, mesas_2p = [], []
+                
+                # ZONAS PROHIBIDAS (Respeto de Muros y Pasillos)
+                area_interior = hab_principal.buffer(-1.00) 
+                centro_local = hab_principal.centroid
+                
+                pasillos_geom = []
+                for v in vanos_detectados:
+                    linea_pasillo = LineString([(v['cx'], v['cy']), (centro_local.x, centro_local.y)])
+                    pasillos_geom.append(linea_pasillo.buffer(pasillo_min / 2.0))
+                
+                red_prohibida = unary_union(pasillos_geom)
+
+                if not area_interior.is_empty and area_habitable >= 6.0:
+                    bx1, by1, bx2, by2 = area_interior.bounds
+                    
+                    # PASADA 1: Mesas de 4p (Paso holgado 2.40m)
+                    paso_4p = 2.40 
+                    x_c = bx1 + 0.6
+                    while x_c <= bx2:
+                        y_c = by1 + 0.6
+                        while y_c <= by2:
+                            pt = Point(x_c, y_c)
+                            if area_interior.contains(pt) and not red_prohibida.contains(pt):
+                                # Radar Anti-Colisión
+                                if all(pt.distance(Point(m['x'], m['y'])) >= 2.0 for m in mesas_4p):
+                                    mesas_4p.append({"id": "mesa_4p.skp", "x": round(x_c,2), "y": round(y_c,2), "z": 0.0, "rot": 0, "asientos": 4})
+                            y_c += paso_4p
+                        x_c += paso_4p
+
+                    # PASADA 2: Mesas de 2p (Relleno seguro de residuos)
+                    zonas_ocupadas = [Point(m['x'], m['y']).buffer(1.20) for m in mesas_4p] + pasillos_geom
+                    area_residual = area_interior.difference(unary_union(zonas_ocupadas))
+                    
+                    if not area_residual.is_empty:
+                        paso_2p = 1.40
+                        rx = bx1 + 0.5
+                        while rx <= bx2:
+                            ry = by1 + 0.5
+                            while ry <= by2:
+                                pt_res = Point(rx, ry)
+                                if area_residual.contains(pt_res):
+                                    if all(pt_res.distance(Point(m['x'], m['y'])) > 1.2 for m in mesas_2p):
+                                        mesas_2p.append({"id": "mesa_2p.skp", "x": round(rx,2), "y": round(ry,2), "z": 0.0, "rot": 0, "asientos": 2})
+                                ry += paso_2p
+                            rx += paso_2p
+
+                asientos_totales = (len(mesas_4p)*4) + (len(mesas_2p)*2)
+                cumple_norma = asientos_totales <= aforo_legal_max
+                
+                datos_proyecto = {
+                    "altura_muros": 2.80,
+                    "muros": [[{"x": round(x,2), "y": round(y,2)} for x,y in p.exterior.coords] for p in muros_solidos],
+                    "contorno_piso": [{"x": round(x,2), "y": round(y,2)} for x,y in hab_principal.exterior.coords],
+                    "vanos": vanos_detectados,
+                    "muebles": mesas_4p + mesas_2p,
+                    "reporte": {"area_m2": area_habitable, "aforo_legal": aforo_legal_max, "asientos": asientos_totales}
+                }
+                
+                col1, col2, col3, col4 = st.columns(4)
+                col1.metric("📐 Área Útil", f"{area_habitable} m²")
+                col2.metric("🏛️ Límite Legal", f"{aforo_legal_max} Pax")
+                col3.metric("🪑 Asientos (Mobiliario)", f"{asientos_totales} Pax")
+                col4.metric("⚖️ Estado", "APROBADO" if cumple_norma else "ALERTA", delta_color="normal" if cumple_norma else "inverse")
+
+                st.download_button("📦 Descargar proyecto.json", data=json.dumps(datos_proyecto, indent=4), file_name="proyecto.json")
+
+        except Exception as e:
+            st.error(f"❌ Error: {e}")
+        finally:
+            if os.path.exists(ruta_temporal): os.remove(ruta_temporal)

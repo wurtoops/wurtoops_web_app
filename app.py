@@ -18,7 +18,7 @@ if 'datos_proyecto' not in st.session_state:
 factor_area = 1.50  
 pasillo_min = 1.20  
 
-archivo_dxf = st.file_uploader("📥 Arrastra aquí el plano CAD (.DXF)", type=['dxf'])
+archivo_dxf = st.file_uploader("📥 Arrastra aquí el plano CAD ruidoso (.DXF)", type=['dxf'])
 
 if archivo_dxf is not None:
     if st.button("🚀 Generar 3D Automáticamente"):
@@ -27,7 +27,7 @@ if archivo_dxf is not None:
             ruta_temporal = tmp_file.name
 
         try:
-            with st.spinner("🧠 Analizando geometría y deduciendo espesores..."):
+            with st.spinner("🧠 Filtrando ruido CAD y limpiando vectores..."):
                 doc = ezdxf.readfile(ruta_temporal)
                 msp = doc.modelspace()
                 muros_crudos = []
@@ -52,7 +52,8 @@ if archivo_dxf is not None:
 
                 red_unida = unary_union(snap(unary_union(lineas_limpias), unary_union(lineas_limpias), tolerance=0.10))
                 
-                muros_solidos = [p for p in polygonize(red_unida) if p.is_valid and p.buffer(-0.10).is_empty]
+                # FILTRO ANTI-POLVO: Solo cuenta como muro si su área es > 0.05m2
+                muros_solidos = [p for p in polygonize(red_unida) if p.is_valid and p.buffer(-0.10).is_empty and p.area > 0.05]
                 if not muros_solidos:
                     muro_buffer = red_unida.buffer(0.10, cap_style=2, join_style=2)
                     muros_solidos = list(muro_buffer.geoms) if isinstance(muro_buffer, MultiPolygon) else [muro_buffer]
@@ -63,12 +64,14 @@ if archivo_dxf is not None:
                 
                 cands = [g for g in (vacios.geoms if hasattr(vacios, 'geoms') else [vacios]) if isinstance(g, Polygon) and g.area > 2.0]
                 hab_principal = max(cands, key=lambda h: h.area) if cands else envoltura
-                area_habitable = round(hab_principal.area, 2)
+                
+                # SIMPLIFICACIÓN: Borrar micro-curvas del piso
+                hab_limpia = hab_principal.simplify(0.05, preserve_topology=True)
+                area_habitable = round(hab_limpia.area, 2)
 
                 # ESCÁNER DE VANOS
                 vanos_detectados = []
-                perimetro_simplificado = hab_principal.simplify(0.05, preserve_topology=True)
-                coords_per = list(perimetro_simplificado.exterior.coords)
+                coords_per = list(hab_limpia.exterior.coords)
                 
                 for i in range(len(coords_per) - 1):
                     p1, p2 = coords_per[i], coords_per[i+1]
@@ -79,14 +82,12 @@ if archivo_dxf is not None:
                         if segmento.intersection(union_muros).length < (dist * 0.20):
                             pm = Point((p1[0]+p2[0])/2.0, (p1[1]+p2[1])/2.0)
                             
-                            # LÁSER DE PROFUNDIDAD
                             nx, ny = -(p2[1]-p1[1])/dist, (p2[0]-p1[0])/dist
                             test_pt = Point(pm.x + nx*0.2, pm.y + ny*0.2)
-                            if hab_principal.contains(test_pt):
+                            if hab_limpia.contains(test_pt):
                                 nx, ny = -nx, -ny
                                 
                             rayo = LineString([(pm.x, pm.y), (pm.x + nx*1.20, pm.y + ny*1.20)])
-                            
                             if rayo.intersection(union_muros).length < 0.1:
                                 rot = round(math.degrees(math.atan2(p2[1]-p1[1], p2[0]-p1[0])), 1)
                                 
@@ -108,24 +109,21 @@ if archivo_dxf is not None:
                                         "ancho": round(dist, 2), "rot": rot, "espesor": espesor_real
                                     })
 
-            with st.spinner("🪑 Calculando Aforo Comercial Ideal..."):
+            with st.spinner("🪑 Maximizando Aforo Comercial..."):
                 aforo_legal_max = math.floor(area_habitable / factor_area)
                 mesas_4p, mesas_2p = [], []
                 
-                # Margen de 80cm a la pared (ideal para sillas guardadas)
-                area_interior = hab_principal.buffer(-0.80) 
+                area_interior = hab_limpia.buffer(-0.80) 
                 
-                # Burbuja de evacuación ajustada a 1.20m en la puerta
                 burbujas_geom = []
                 for v in vanos_detectados:
                     if v['tipo'] == 'puerta':
                         burbujas_geom.append(Point(v['cx'], v['cy']).buffer(1.20))
                 red_prohibida = unary_union(burbujas_geom)
 
-                if area_habitable >= 6.0:
-                    bx1, by1, bx2, by2 = hab_principal.bounds
+                if area_habitable >= 6.0 and not area_interior.is_empty:
+                    bx1, by1, bx2, by2 = hab_limpia.bounds
                     
-                    # PASADA 1: MESAS DE 4 (Grilla óptima comercial a 1.90m)
                     paso_4p = 1.90 
                     x_c = bx1 + 0.4
                     while x_c <= bx2:
@@ -133,13 +131,11 @@ if archivo_dxf is not None:
                         while y_c <= by2:
                             pt = Point(x_c, y_c)
                             if area_interior.contains(pt) and not red_prohibida.contains(pt):
-                                # Radar ajustado a 1.80m
                                 if all(math.hypot(x_c - m['x'], y_c - m['y']) >= 1.80 for m in mesas_4p):
                                     mesas_4p.append({"id": "mesa_4p.skp", "x": round(x_c,2), "y": round(y_c,2), "z": 0.0, "rot": 0, "asientos": 4})
                             y_c += paso_4p
                         x_c += paso_4p
 
-                    # PASADA 2: MESAS DE 2 (Relleno orgánico)
                     paso_2p = 1.30
                     rx = bx1 + 0.4
                     while rx <= bx2:
@@ -156,10 +152,16 @@ if archivo_dxf is not None:
 
                 asientos_totales = (len(mesas_4p)*4) + (len(mesas_2p)*2)
                 
+                # SIMPLIFICAR MUROS PARA SKETCHUP
+                muros_export = []
+                for p in muros_solidos:
+                    p_simp = p.simplify(0.02, preserve_topology=True)
+                    muros_export.append([{"x": round(x,2), "y": round(y,2)} for x,y in p_simp.exterior.coords])
+
                 datos_proyecto = {
                     "altura_muros": 2.80,
-                    "muros": [[{"x": round(x,2), "y": round(y,2)} for x,y in p.exterior.coords] for p in muros_solidos],
-                    "contorno_piso": [{"x": round(x,2), "y": round(y,2)} for x,y in hab_principal.exterior.coords],
+                    "muros": muros_export,
+                    "contorno_piso": [{"x": round(x,2), "y": round(y,2)} for x,y in hab_limpia.exterior.coords],
                     "vanos": vanos_detectados,
                     "muebles": mesas_4p + mesas_2p,
                     "reporte": {"area_m2": area_habitable, "aforo_legal": aforo_legal_max, "asientos": asientos_totales}

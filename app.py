@@ -11,11 +11,16 @@ st.set_page_config(page_title="Patty | ConTech Engine", page_icon="🏗️", lay
 st.title("🏗️ Patty - Generador Arquitectónico Paramétrico")
 st.markdown("---")
 
+# MEMORIA RAM DEL SERVIDOR (Evita leer archivos gigantes múltiples veces)
 if 'datos_proyecto' not in st.session_state:
     st.session_state['datos_proyecto'] = None
     st.session_state['metrics'] = None
+if 'capas_disponibles' not in st.session_state:
     st.session_state['capas_disponibles'] = []
+if 'archivo_path' not in st.session_state:
     st.session_state['archivo_path'] = None
+if 'nombre_archivo' not in st.session_state:
+    st.session_state['nombre_archivo'] = ""
 
 factor_area = 1.50  
 pasillo_min = 1.20  
@@ -23,54 +28,59 @@ pasillo_min = 1.20
 archivo_dxf = st.file_uploader("📥 Arrastra aquí el plano CAD (.DXF)", type=['dxf'])
 
 if archivo_dxf is not None:
-    # Guardar el archivo temporalmente solo si acaba de subir
-    if st.session_state['archivo_path'] is None or not os.path.exists(st.session_state['archivo_path']):
+    # 1. SI ES UN ARCHIVO NUEVO, LO LEEMOS UNA SOLA VEZ
+    if st.session_state['nombre_archivo'] != archivo_dxf.name:
+        st.session_state['nombre_archivo'] = archivo_dxf.name
+        st.session_state['datos_proyecto'] = None # Resetea resultados anteriores
+        
         with tempfile.NamedTemporaryFile(delete=False, suffix=".dxf") as tmp_file:
             tmp_file.write(archivo_dxf.getvalue())
             st.session_state['archivo_path'] = tmp_file.name
+            
+        with st.spinner("⏳ Descomprimiendo CAD (esto puede tomar unos segundos en archivos pesados)..."):
+            try:
+                doc = ezdxf.readfile(st.session_state['archivo_path'])
+                msp = doc.modelspace()
+                capas = set()
+                for e in msp.query('LINE LWPOLYLINE'):
+                    capas.add(e.dxf.layer)
+                st.session_state['capas_disponibles'] = sorted(list(capas))
+            except Exception as e:
+                st.error(f"Error al leer el archivo: {e}")
 
-    # 1. LECTURA RÁPIDA DE CAPAS
-    try:
-        doc = ezdxf.readfile(st.session_state['archivo_path'])
-        msp = doc.modelspace()
-        capas = set()
-        for e in msp.query('LINE LWPOLYLINE'):
-            capas.add(e.dxf.layer)
-        st.session_state['capas_disponibles'] = sorted(list(capas))
-    except Exception as e:
-        st.error(f"Error leyendo capas: {e}")
-
-    # 2. UI DE TRADUCTOR DE CAPAS
+    # 2. UI SÚPER RÁPIDA (Ya no lee el archivo al hacer clics)
     if st.session_state['capas_disponibles']:
-        st.info(f"🔍 Detectamos {len(st.session_state['capas_disponibles'])} capas en este plano.")
+        st.info(f"🔍 Detectamos {len(st.session_state['capas_disponibles'])} capas con geometría en este plano.")
         
         capas_seleccionadas = st.multiselect(
             "👉 Selecciona SOLO las capas que contienen los MUROS reales (ignora terreno, cotas, muebles):",
             st.session_state['capas_disponibles'],
-            default=[st.session_state['capas_disponibles'][0]] # Selecciona la primera por defecto
+            default=[st.session_state['capas_disponibles'][0]] if st.session_state['capas_disponibles'] else []
         )
 
-        if st.button("🚀 Generar 3D Limpio"):
+        if st.button("🚀 Procesar Arquitectura Limpia"):
             try:
-                with st.spinner("🧠 Filtrando ruido y procesando arquitectura..."):
-                    
-                    # Construir la query para leer SOLO las capas elegidas
-                    query_str = " ".join([f'LINE[layer=="{c}"] LWPOLYLINE[layer=="{c}"]' for c in capas_seleccionadas])
+                with st.spinner("🧠 Filtrando toneladas de ruido y procesando 3D..."):
+                    # Volvemos a abrir el documento solo para extraer lo seleccionado
+                    doc = ezdxf.readfile(st.session_state['archivo_path'])
+                    msp = doc.modelspace()
                     
                     muros_crudos = []
-                    for e in msp.query(query_str):
-                        if e.dxftype() == 'LINE':
-                            p1, p2 = (e.dxf.start.x, e.dxf.start.y), (e.dxf.end.x, e.dxf.end.y)
-                            if p1 != p2: muros_crudos.append({"x1": p1[0], "y1": p1[1], "x2": p2[0], "y2": p2[1]})
-                        elif e.dxftype() == 'LWPOLYLINE':
-                            pts = [(float(p[0]), float(p[1])) for p in e.get_points('xy')]
-                            for i in range(len(pts) - 1):
-                                if pts[i] != pts[i+1]: muros_crudos.append({"x1": pts[i][0], "y1": pts[i][1], "x2": pts[i+1][0], "y2": pts[i+1][1]})
-                            if getattr(e, 'is_closed', False) and pts[-1] != pts[0]:
-                                muros_crudos.append({"x1": pts[-1][0], "y1": pts[-1][1], "x2": pts[0][0], "y2": pts[0][1]})
+                    # FILTRO PYTHON SÚPER SEGURO
+                    for e in msp.query('LINE LWPOLYLINE'):
+                        if e.dxf.layer in capas_seleccionadas:
+                            if e.dxftype() == 'LINE':
+                                p1, p2 = (e.dxf.start.x, e.dxf.start.y), (e.dxf.end.x, e.dxf.end.y)
+                                if p1 != p2: muros_crudos.append({"x1": p1[0], "y1": p1[1], "x2": p2[0], "y2": p2[1]})
+                            elif e.dxftype() == 'LWPOLYLINE':
+                                pts = [(float(p[0]), float(p[1])) for p in e.get_points('xy')]
+                                for i in range(len(pts) - 1):
+                                    if pts[i] != pts[i+1]: muros_crudos.append({"x1": pts[i][0], "y1": pts[i][1], "x2": pts[i+1][0], "y2": pts[i+1][1]})
+                                if getattr(e, 'is_closed', False) and pts[-1] != pts[0]:
+                                    muros_crudos.append({"x1": pts[-1][0], "y1": pts[-1][1], "x2": pts[0][0], "y2": pts[0][1]})
 
                     if not muros_crudos:
-                        st.error("❌ No hay líneas en las capas seleccionadas.")
+                        st.error("❌ No se encontraron líneas en las capas seleccionadas.")
                         st.stop()
 
                     todos_x = [m['x1'] for m in muros_crudos] + [m['x2'] for m in muros_crudos]

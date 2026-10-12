@@ -16,81 +16,96 @@ st.title("🏗️ Patty - Generador Arquitectónico Paramétrico")
 st.markdown("---")
 
 # ==============================================================================
-# 1. ESQUEMA ESTRICTO GEMINI FLASH
+# 1. ESQUEMA MULTICOTA DINÁMICO (PROTOBUF-SAFE, N-COTAS ILIMITADAS)
 # ==============================================================================
-class RecintoInfo(BaseModel):
-    nombre_recinto: str = Field(
-        description="Nombre del espacio o locatario detectado (ej. MC DONALD'S, LOCAL COMERCIAL, RESTAURANTE, SALA)"
-    )
-    altura_muro: float = Field(
-        description="Altura libre vertical detectada en metros entre piso y losa/viga (ej. 4.50, 2.80)"
-    )
-    nivel_piso: float = Field(
-        description="Cota de nivel de piso terminado NPT en metros (ej. 5.95, 6.00, 0.00)"
-    )
+class CotaPiso(BaseModel):
+    etiqueta: str = Field(description="Nombre o etiqueta del nivel (ej. 'NPT Interior', 'NPT Pasillo Mall')")
+    cota_metros: float = Field(description="Valor numérico de la cota en metros (ej. 5.95, 6.00, 0.00)")
+    es_interior: bool = Field(description="True si pertenece al interior del local/recinto, False si es exterior")
 
-class InferenciaCotas(BaseModel):
-    recinto: RecintoInfo
-    altura_general: float = Field(
-        description="Altura global o cota estándar detectada en metros"
-    )
-    observacion: str = Field(
-        description="Detalle de las cotas encontradas en el plano o corte"
-    )
+class ElementoTecho(BaseModel):
+    tipo: str = Field(description="Tipo: 'LOSA_TECHO', 'VIGA_DESCOLGADA', 'MARCO_ACCESO', 'FALSO_TECHO'")
+    descripcion: str = Field(description="Descripción encontrada (ej. 'Losa Colaborante', 'Viga Concreto S/C', 'Marco Metálico', 'VP-210')")
+    altura_metros: float = Field(description="Altura libre o cota inferior del elemento en metros (ej. 4.50, 3.90, 5.10)")
+    descuelgue_metros: float = Field(description="Peralte o descuelgue si es viga (ej. 0.60), o 0.0 si es losa/marco")
 
-def deducir_alturas_con_gemini(textos_interior: list, textos_globales: list) -> tuple:
+class InferenciaMulticota(BaseModel):
+    nombre_espacio: str = Field(description="Nombre del espacio, locatario o marca detectada (ej. MC DONALD'S, LOCAL COMERCIAL)")
+    altura_dominante_muro: float = Field(description="Altura dominante para la extrusión de muros perimetrales en metros")
+    nivel_piso_dominante: float = Field(description="Cota NPT dominante del piso interior en metros")
+    pisos_detectados: List[CotaPiso] = Field(description="Lista de todas las cotas de piso NPT encontradas")
+    alturas_techo: List[ElementoTecho] = Field(description="Lista de todas las alturas de losa, vigas y marcos encontradas")
+    observacion_ingenieria: str = Field(description="Resumen de desniveles de piso y estructura de techos observada")
+
+def deducir_alturas_multicota(textos_interior: list, textos_globales: list) -> dict:
+    """
+    Envía todas las anotaciones y cotas a Gemini Flash con esquema Multicota dinámico.
+    """
     api_key = os.environ.get("GEMINI_API_KEY") or st.secrets.get("GEMINI_API_KEY", None)
     
+    fallback_data = {
+        "nombre_espacio": "Espacio Comercial",
+        "altura_dominante": 2.80,
+        "nivel_piso_dominante": 0.00,
+        "pisos": [{"etiqueta": "Piso General", "cota_metros": 0.00, "es_interior": True}],
+        "elementos_techo": [{"tipo": "LOSA_TECHO", "descripcion": "Techo Estándar", "altura_metros": 2.80, "descuelgue_metros": 0.0}],
+        "observacion": "Modo seguro (Default)"
+    }
+
     if not api_key:
         st.warning("⚠️ No se encontró GEMINI_API_KEY en Streamlit Secrets.")
-        return 2.80, 0.00, "Sin API Key (Default)"
+        return fallback_data
 
     if not textos_interior and not textos_globales:
-        return 2.80, 0.00, "Sin textos en CAD (Default)"
+        return fallback_data
 
     try:
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel("gemini-3.8-flash")
+        model = genai.GenerativeModel("gemini-1.5-flash")
 
         prompt = f"""
-        Eres un motor ConTech experto en análisis arquitectónico, planos y cortes de construcción.
-        Analiza las anotaciones, cotas y directrices extraídas de este archivo CAD:
+        Eres un motor ConTech experto en ingeniería civil, arquitectura y lectura forense de cortes CAD.
+        Analiza TODAS las anotaciones, cotas numéricas, directrices y textos de este archivo:
 
         - ANOTACIONES ASOCIADAS AL RECINTO:
         {json.dumps(textos_interior, ensure_ascii=False)}
 
-        - ANOTACIONES Y COTAS GENERALES DEL DIBUJO/CORTE:
+        - ANOTACIONES Y COTAS GENERALES DEL CORTE/PLANO:
         {json.dumps(textos_globales, ensure_ascii=False)}
 
         INSTRUCCIONES CLAVE:
-        1. Identifica el nombre del recinto o marca/locatario (ej. 'MC DONALD\'S', 'LOCAL COMERCIAL'). Si no hay, pon 'Espacio Comercial'.
-        2. Deduce la altura libre vertical entre piso y losa/viga (ej. cotas dimensionales como '4.50', '4.5', 'COTA 4.50', H=4.50). Conviértela a float en metros. Si no hay, devuelve 2.80.
-        3. Identifica niveles de piso terminado (ej. 'NPT +5.95', 'NPT +6.00'). Si no hay cota NPT, devuelve 0.00.
-        4. Si encuentras cotas numéricas puras como 'COTA 4.5' o '4.50', evalúa si corresponden a la altura del espacio.
+        1. Identifica el nombre del locatario/marca (ej. 'MC DONALD\'S', 'LOCAL COMERCIAL').
+        2. EXTRAE TODOS LOS NIVELES DE PISO (N.P.T.): Diferencia el NPT interior del local (ej. 5.95) del NPT de pasillos exteriores (ej. 6.00).
+        3. EXTRAE TODAS LAS ALTURAS Y ELEMENTOS DE TECHO:
+           - Altura libre a marcos de acceso o dinteles (ej. 4.50).
+           - Losa de techo estructural o losa colaborante (si está referenciada).
+           - Vigas de concreto o peraltadas descolgadas (ej. 'Viga concreto S/C', 'VP-210', con su descuelgue ej. 0.60m).
+        4. Define la altura dominante de muros y el NPT interior dominante para extrusión base.
         """
 
         respuesta = model.generate_content(
             prompt,
             generation_config=genai.GenerationConfig(
                 response_mime_type="application/json",
-                response_schema=InferenciaCotas,
+                response_schema=InferenciaMulticota,
                 temperature=0.0
             )
         )
 
         datos = json.loads(respuesta.text)
-        recinto = datos.get("recinto", {})
-        altura_general = datos.get("altura_general", 2.80)
-
-        altura_final = recinto.get("altura_muro") or altura_general or 2.80
-        nivel_piso_final = recinto.get("nivel_piso", 0.00)
-        nombre_final = recinto.get("nombre_recinto") or "Espacio Comercial"
-
-        return round(float(altura_final), 2), round(float(nivel_piso_final), 2), nombre_final
+        
+        return {
+            "nombre_espacio": datos.get("nombre_espacio", "Espacio Comercial"),
+            "altura_dominante": round(float(datos.get("altura_dominante_muro", 2.80)), 2),
+            "nivel_piso_dominante": round(float(datos.get("nivel_piso_dominante", 0.00)), 2),
+            "pisos": datos.get("pisos_detectados", []),
+            "elementos_techo": datos.get("alturas_techo", []),
+            "observacion": datos.get("observacion_ingenieria", "")
+        }
 
     except Exception as e:
-        st.error(f"❌ Error al consultar Gemini API: {e}")
-        return 2.80, 0.00, "Error en Gemini (Fallback)"
+        st.error(f"❌ Error al consultar Gemini Multicota: {e}")
+        return fallback_data
 
 # ==============================================================================
 # 2. MEMORIA RAM EFÍMERA EN STREAMLIT
@@ -196,7 +211,7 @@ if archivo_dxf is not None:
                             except Exception:
                                 pass
 
-                    # 3. COLUMNAS EXTRAÍDAS (si se seleccionaron capas de columnas)
+                    # 3. COLUMNAS EXTRAÍDAS
                     lineas_columnas = []
                     if capas_columnas:
                         for e in msp.query('LINE LWPOLYLINE'):
@@ -288,26 +303,20 @@ if archivo_dxf is not None:
                     
                     todos_vacios = [g for g in (vacios.geoms if hasattr(vacios, 'geoms') else [vacios]) if isinstance(g, Polygon)]
                     
-                    # ==========================================================
-                    # FUSIÓN INTELIGENTE DE RECINTOS CONTIGUOS (MODO RETAIL)
-                    # ==========================================================
+                    # FUSIÓN INTELIGENTE DE RECINTOS CONTIGUOS
                     cands = [g for g in todos_vacios if g.area > 2.0]
                     if cands:
-                        # Une polígonos que comparten bordes (ej. trapecio + cuerpo inferior)
                         fusion = unary_union(cands)
                         if isinstance(fusion, Polygon):
                             hab_principal = fusion
                         elif isinstance(fusion, MultiPolygon):
-                            # Si están separados, toma el conjunto contiguo más grande
                             hab_principal = max(fusion.geoms, key=lambda h: h.area)
                         else:
                             hab_principal = max(cands, key=lambda h: h.area)
                     else:
                         hab_principal = max(todos_vacios, key=lambda h: h.area) if todos_vacios else envoltura
 
-                    # ==========================================================
-                    # SUSTRACCIÓN DE COLUMNAS (PERFORAR HUECOS EN EL SUELO)
-                    # ==========================================================
+                    # SUSTRACCIÓN DE COLUMNAS ESTRUCTURALES
                     if lineas_columnas:
                         col_geom = [LineString([((m['x1']-min_x)/factor, (m['y1']-min_y)/factor), ((m['x2']-min_x)/factor, (m['y2']-min_y)/factor)]) for m in lineas_columnas]
                         col_polys = [p for p in polygonize(unary_union(col_geom)) if p.is_valid and p.area > 0.04]
@@ -363,10 +372,9 @@ if archivo_dxf is not None:
                                                 "ancho": round(dist, 2), "rot": rot, "espesor": 0.15
                                             })
 
-                with st.spinner("🤖 Leyendo cotas y deduciendo alturas con Gemini Flash..."):
-                    altura_deducida, nivel_piso_deducido, nombre_espacio = deducir_alturas_con_gemini(
-                        textos_dentro, textos_fuera
-                    )
+                # LLAMADA A GEMINI MULTICOTA DINÁMICO
+                with st.spinner("🤖 Analizando perfil vertical completo (pisos y techos) con Gemini Flash..."):
+                    perfil_vertical = deducir_alturas_multicota(textos_dentro, textos_fuera)
 
                 with st.spinner("🪑 Maximizando Aforo Comercial..."):
                     aforo_legal_max = math.floor(area_habitable / factor_area)
@@ -416,17 +424,22 @@ if archivo_dxf is not None:
                         p_simp = p.simplify(0.02, preserve_topology=True)
                         muros_export.append([{"x": round(x,2), "y": round(y,2)} for x,y in p_simp.exterior.coords])
 
-                    # Contorno de piso unificado (soporta MultiPolygon si aplica)
                     coords_contorno = []
                     if hasattr(hab_limpia, 'exterior'):
                         coords_contorno = [{"x": round(x,2), "y": round(y,2)} for x,y in hab_limpia.exterior.coords]
                     elif hasattr(hab_limpia, 'geoms'):
                         coords_contorno = [{"x": round(x,2), "y": round(y,2)} for x,y in hab_limpia.geoms[0].exterior.coords]
 
+                    # CONTRATO JSON ENRIQUECIDO MULTICOTA
                     datos_proyecto = {
-                        "espacio": nombre_espacio,
-                        "altura_muros": altura_deducida,
-                        "nivel_piso": nivel_piso_deducido,
+                        "espacio": perfil_vertical["nombre_espacio"],
+                        "altura_muros": perfil_vertical["altura_dominante"],
+                        "nivel_piso": perfil_vertical["nivel_piso_dominante"],
+                        "perfil_vertical": {
+                            "pisos": perfil_vertical["pisos"],
+                            "elementos_techo": perfil_vertical["elementos_techo"],
+                            "observacion": perfil_vertical["observacion"]
+                        },
                         "muros": muros_export,
                         "contorno_piso": coords_contorno,
                         "vanos": vanos_detectados,
@@ -443,24 +456,51 @@ if archivo_dxf is not None:
                         "area": area_habitable, 
                         "legal": aforo_legal_max, 
                         "asientos": asientos_totales,
-                        "espacio": nombre_espacio,
-                        "altura": altura_deducida,
-                        "npt": nivel_piso_deducido
+                        "espacio": perfil_vertical["nombre_espacio"],
+                        "altura": perfil_vertical["altura_dominante"],
+                        "npt": perfil_vertical["nivel_piso_dominante"],
+                        "pisos": perfil_vertical["pisos"],
+                        "techos": perfil_vertical["elementos_techo"],
+                        "obs": perfil_vertical["observacion"]
                     }
 
             except Exception as e:
                 st.error(f"❌ Error al procesar: {e}")
 
 # ==============================================================================
-# 3. INTERFAZ Y DESCARGA
+# 3. INTERFAZ Y DASHBOARD MULTICOTA
 # ==============================================================================
 if st.session_state['datos_proyecto']:
     m = st.session_state['metrics']
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("🏷️ Espacio", f"{m['espacio']}")
-    col2.metric("📐 Altura Muros (H)", f"{m['altura']} m")
+    col2.metric("📐 Altura Dominante", f"{m['altura']} m")
     col3.metric("🏛️ Aforo Legal", f"{m['legal']} Pax")
     col4.metric("🪑 Asientos Diseñados", f"{m['asientos']} Pax")
 
-    st.success(f"Cota N.P.T.: {m['npt']} m | Área Útil: {m['area']} m²")
+    st.success(f"Cota N.P.T. Base: {m['npt']} m | Área Útil: {m['area']} m²")
+
+    # PANEL MULTICOTA AUDITABLE
+    with st.expander("📊 Desglose de Alturas, Desniveles y Vigas Detectadas"):
+        st.markdown(f"**Observación de Ingeniería:** {m['obs']}")
+        
+        col_m1, col_m2 = st.columns(2)
+        with col_m1:
+            st.markdown("### 📍 Niveles de Piso (N.P.T.)")
+            if m['pisos']:
+                for p in m['pisos']:
+                    icono = "🏠" if p.get('es_interior', True) else "🚶"
+                    st.write(f"{icono} **{p.get('etiqueta', 'Nivel')}**: `{p.get('cota_metros')} m`")
+            else:
+                st.write("Sin desniveles adicionales.")
+
+        with col_m2:
+            st.markdown("### 🏗️ Estructura de Techos y Vigas")
+            if m['techos']:
+                for t in m['techos']:
+                    desc = f" (Descuelgue: -{t.get('descuelgue_metros')}m)" if t.get('descuelgue_metros', 0) > 0 else ""
+                    st.write(f"🔹 **{t.get('descripcion', t.get('tipo'))}**: `{t.get('altura_metros')} m`{desc}")
+            else:
+                st.write("Techo plano homogéneo.")
+
     st.download_button("📦 Descargar JSON de Patty", data=st.session_state['datos_proyecto'], file_name="proyecto.json")

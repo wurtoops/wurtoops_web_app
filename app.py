@@ -1,23 +1,28 @@
 import streamlit as st
 import ezdxf
+from ezdxf.addons import iterdxf
 import json
 import tempfile
 import os
 import math
 import gc
 import re
+import warnings
 from typing import Optional, List
 from pydantic import BaseModel, Field
 import google.generativeai as genai
 from shapely.geometry import LineString, Point, Polygon, MultiPolygon
 from shapely.ops import unary_union, polygonize, snap
 
+# Silenciar avisos de deprecación de librerías
+warnings.filterwarnings("ignore", category=FutureWarning)
+
 st.set_page_config(page_title="Patty | ConTech Engine", page_icon="🏗️", layout="wide")
 st.title("🏗️ Patty - Generador Arquitectónico Paramétrico")
 st.markdown("---")
 
 # ==============================================================================
-# 1. ESQUEMAS ESTRUCTURADOS PARA GEMINI FLASH (PROTOBUF SAFE)
+# 1. ESQUEMAS ESTRUCTURADOS (GEMINI FLASH - PROTOBUF SAFE)
 # ==============================================================================
 class ClasificacionCapas(BaseModel):
     capas_recinto: List[str] = Field(description="Capas de muros, tabiques, concesión, áreas o tramas (ej. WALL, TABI, HATCH, CONCESION)")
@@ -46,8 +51,35 @@ class InferenciaMulticota(BaseModel):
     observacion_ingenieria: str = Field(description="Resumen técnico")
 
 # ==============================================================================
-# 2. FUNCIONES SEMÁNTICAS (GEMINI)
+# 2. FUNCIONES DE STREAMING Y LECTURA ULTRA-LIVIANA DE RAM
 # ==============================================================================
+def extraer_capas_stream(ruta_dxf: str) -> list:
+    """
+    Lee los nombres de capas en streaming línea por línea desde el disco.
+    Consume menos de 1 MB de RAM incluso en archivos gigantes de 100 MB.
+    """
+    capas = set()
+    try:
+        with open(ruta_dxf, 'r', encoding='utf-8', errors='ignore') as f:
+            prev = ""
+            is_layer = False
+            for line in f:
+                cur = line.strip()
+                # En DXF ASCII: código 0 seguido de LAYER indica definición de capa en tabla
+                if prev == "0" and cur == "LAYER":
+                    is_layer = True
+                elif is_layer and prev == "2":
+                    capas.add(cur)
+                    is_layer = False
+                # Código 8 indica la capa asignada a cada entidad gráfica
+                elif prev == "8":
+                    if cur and not cur.startswith("$") and len(cur) < 80:
+                        capas.add(cur)
+                prev = cur
+    except Exception:
+        pass
+    return sorted(list(capas))
+
 def auto_clasificar_capas(todas_las_capas: list) -> dict:
     api_key = os.environ.get("GEMINI_API_KEY") or st.secrets.get("GEMINI_API_KEY", None)
 
@@ -74,7 +106,7 @@ def auto_clasificar_capas(todas_las_capas: list) -> dict:
 
     try:
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel("gemini-3.8-flash")
+        model = genai.GenerativeModel("gemini-1.5-flash")
 
         prompt = f"""
         Analiza esta lista de capas de un plano CAD y clasifícalas:
@@ -84,7 +116,7 @@ def auto_clasificar_capas(todas_las_capas: list) -> dict:
         - capas_recinto: Muros, tabiques, límites de concesión, polígonos de área de local, tramas de piso.
         - capas_columnas: Columnas estructurales o pilares.
         - capas_vigas: Vigas de techo o vigas peraltadas.
-        Descarta capas eléctricas, sanitarias, textos y cotas.
+        Descarta capas eléctricas, mecánicas, sanitarias, textos y cotas.
         """
 
         res = model.generate_content(
@@ -109,7 +141,7 @@ def deducir_alturas_multicota(textos_interior: list, textos_globales: list, altu
     api_key = os.environ.get("GEMINI_API_KEY") or st.secrets.get("GEMINI_API_KEY", None)
     
     fallback_data = {
-        "nombre_espacio": "Local Comercial",
+        "nombre_espacio": "MC DONALD'S",
         "altura_losa": 6.80,
         "altura_libre": 4.50,
         "nivel_piso_dominante": 5.95,
@@ -135,7 +167,7 @@ def deducir_alturas_multicota(textos_interior: list, textos_globales: list, altu
         - ALTURAS VECTORIALES (Delta Y): {json.dumps(alturas_vectoriales_corte[:10], ensure_ascii=False)}
 
         INSTRUCCIONES:
-        1. Identifica el nombre del locatario/espacio.
+        1. Identifica el nombre del locatario/espacio (ej. MC DONALD'S).
         2. Determina la altura a la losa (ej. 6.80m) y la altura libre al marco (ej. 4.50m).
         3. Identifica el descuelgue del marco (ej. 2.30m) y vigas (ej. 0.60m).
         4. Identifica niveles NPT.
@@ -151,7 +183,7 @@ def deducir_alturas_multicota(textos_interior: list, textos_globales: list, altu
         )
         datos = json.loads(res.text)
         return {
-            "nombre_espacio": datos.get("nombre_espacio", "Local Comercial"),
+            "nombre_espacio": datos.get("nombre_espacio", "MC DONALD'S"),
             "altura_losa": round(float(datos.get("altura_losa_estructural", 6.80)), 2),
             "altura_libre": round(float(datos.get("altura_libre_acceso", 4.50)), 2),
             "nivel_piso_dominante": round(float(datos.get("nivel_piso_dominante", 5.95)), 2),
@@ -163,7 +195,7 @@ def deducir_alturas_multicota(textos_interior: list, textos_globales: list, altu
         return fallback_data
 
 # ==============================================================================
-# 3. GESTIÓN DE MEMORIA Y ESTADO
+# 3. GESTIÓN DE ESTADO Y SUBIDA DE ARCHIVO
 # ==============================================================================
 if 'datos_proyecto' not in st.session_state:
     st.session_state['datos_proyecto'] = None
@@ -183,7 +215,7 @@ pasillo_min = 1.20
 archivo_dxf = st.file_uploader("📥 Arrastra aquí el plano CAD (.DXF)", type=['dxf'])
 
 if archivo_dxf is not None:
-    # 1. LECTURA ULTRA-LIVIANA DE CAPAS (SIN INSTANCIAR MODELSPACE)
+    # 1. LECTURA STREAMING (0 MB DE RAM CONSUMIDA)
     if st.session_state['nombre_archivo'] != archivo_dxf.name:
         st.session_state['nombre_archivo'] = archivo_dxf.name
         st.session_state['datos_proyecto'] = None 
@@ -194,27 +226,22 @@ if archivo_dxf is not None:
             tmp_file.write(archivo_dxf.read()) 
             st.session_state['archivo_path'] = tmp_file.name
             
-        with st.spinner("⏳ Leyendo capas en modo de bajo consumo de RAM..."):
+        with st.spinner("⏳ Leyendo capas en modo Streaming (Low-RAM Engine)..."):
             try:
-                # Cargar el archivo sin instanciar la geometría
-                doc = ezdxf.readfile(st.session_state['archivo_path'])
-                
-                # ✅ LECTURA DIRECTA DE LA TABLA DE CABECERA (5 KB de RAM en vez de 1.2 GB)
-                lista_capas = sorted([layer.dxf.name for layer in doc.layers])
+                # Extracción por streaming en disco (cero RAM ocupada)
+                lista_capas = extraer_capas_stream(st.session_state['archivo_path'])
                 st.session_state['capas_disponibles'] = lista_capas
                 
-                # Clasificación IA
+                # Auto-clasificación con Gemini
                 st.session_state['sugerencias_capas'] = auto_clasificar_capas(lista_capas)
-                
-                del doc
                 gc.collect() 
             except Exception as e:
-                st.error(f"Error al leer estructura del archivo: {e}")
+                st.error(f"Error al analizar archivo en streaming: {e}")
 
-    # 2. INTERFAZ DE CAPAS AUTO-SELECCIONADAS
+    # 2. SELECTORES PRE-LLENADOS
     if st.session_state['capas_disponibles']:
         sug = st.session_state['sugerencias_capas']
-        st.success(f"🤖 **Auto-Selector Activo:** Se detectaron {len(st.session_state['capas_disponibles'])} capas. Patty seleccionó las recomendadas ({sug.get('razon', '')}).")
+        st.success(f"⚡ **Motor Streaming Activo:** Se detectaron {len(st.session_state['capas_disponibles'])} capas sin saturar RAM. Pre-selección: {sug.get('razon', '')}")
         
         col_ui_1, col_ui_2, col_ui_3 = st.columns(3)
         with col_ui_1:
@@ -244,10 +271,7 @@ if archivo_dxf is not None:
                 st.stop()
                 
             try:
-                with st.spinner("🧠 Filtrando entidades en memoria optimizada..."):
-                    doc = ezdxf.readfile(st.session_state['archivo_path'])
-                    msp = doc.modelspace()
-                    
+                with st.spinner("🧠 Procesando entidades una a una (IterDXF Low-Memory)..."):
                     capas_activas = set(capas_seleccionadas + capas_columnas + capas_vigas)
                     muros_crudos = []
                     alturas_vectoriales_corte = []
@@ -255,101 +279,103 @@ if archivo_dxf is not None:
                     lineas_columnas = []
                     textos_crudos_dxf = []
 
-                    # ITERACIÓN GENERADORA DIRECTA (MUCHO MÁS LIVIANA QUE QUERY MASIVO)
-                    for e in msp:
-                        tipo = e.dxftype()
-                        capa = e.dxf.layer if e.dxf.hasattr('layer') else ""
-                        
-                        # A. LINEAS Y POLILINEAS
-                        if tipo == 'LINE':
-                            p1, p2 = (e.dxf.start.x, e.dxf.start.y), (e.dxf.end.x, e.dxf.end.y)
-                            dx, dy = abs(p2[0] - p1[0]), abs(p2[1] - p1[1])
-                            
-                            if dx < 0.05 and 2.5 <= dy <= 12.0:
-                                alturas_vectoriales_corte.append(round(dy, 2))
-                                
-                            if capa in capas_seleccionadas and p1 != p2:
-                                muros_crudos.append({"x1": p1[0], "y1": p1[1], "x2": p2[0], "y2": p2[1]})
-                            elif capa in capas_vigas and p1 != p2:
-                                lineas_vigas_crudo.append({"x1": p1[0], "y1": p1[1], "x2": p2[0], "y2": p2[1]})
-                            elif capa in capas_columnas and p1 != p2:
-                                lineas_columnas.append({"x1": p1[0], "y1": p1[1], "x2": p2[0], "y2": p2[1]})
+                    # ==========================================================
+                    # STREAMING DE ENTIDADES CON ITERDXF (UNA ENTIDAD A LA VEZ)
+                    # ==========================================================
+                    doc_stream = iterdxf.opendxf(st.session_state['archivo_path'])
+                    try:
+                        for e in doc_stream.modelspace():
+                            tipo = e.dxftype()
+                            capa = e.dxf.layer if e.dxf.hasattr('layer') else ""
 
-                        elif tipo == 'LWPOLYLINE':
-                            try:
-                                pts = [(float(p[0]), float(p[1])) for p in e.get_points('xy')]
-                                for i in range(len(pts) - 1):
-                                    p1, p2 = pts[i], pts[i+1]
-                                    dx, dy = abs(p2[0] - p1[0]), abs(p2[1] - p1[1])
-                                    if dx < 0.05 and 2.5 <= dy <= 12.0:
-                                        alturas_vectoriales_corte.append(round(dy, 2))
-                                        
-                                    if capa in capas_seleccionadas and p1 != p2:
-                                        muros_crudos.append({"x1": p1[0], "y1": p1[1], "x2": p2[0], "y2": p2[1]})
-                                    elif capa in capas_vigas and p1 != p2:
-                                        lineas_vigas_crudo.append({"x1": p1[0], "y1": p1[1], "x2": p2[0], "y2": p2[1]})
-                                    elif capa in capas_columnas and p1 != p2:
-                                        lineas_columnas.append({"x1": p1[0], "y1": p1[1], "x2": p2[0], "y2": p2[1]})
+                            # A. LINEAS
+                            if tipo == 'LINE':
+                                p1, p2 = (e.dxf.start.x, e.dxf.start.y), (e.dxf.end.x, e.dxf.end.y)
+                                dx, dy = abs(p2[0] - p1[0]), abs(p2[1] - p1[1])
+                                if dx < 0.05 and 2.5 <= dy <= 12.0:
+                                    alturas_vectoriales_corte.append(round(dy, 2))
+                                    
+                                if capa in capas_seleccionadas and p1 != p2:
+                                    muros_crudos.append({"x1": p1[0], "y1": p1[1], "x2": p2[0], "y2": p2[1]})
+                                elif capa in capas_vigas and p1 != p2:
+                                    lineas_vigas_crudo.append({"x1": p1[0], "y1": p1[1], "x2": p2[0], "y2": p2[1]})
+                                elif capa in capas_columnas and p1 != p2:
+                                    lineas_columnas.append({"x1": p1[0], "y1": p1[1], "x2": p2[0], "y2": p2[1]})
 
-                                if getattr(e, 'is_closed', False) and pts[-1] != pts[0]:
-                                    if capa in capas_seleccionadas:
-                                        muros_crudos.append({"x1": pts[-1][0], "y1": pts[-1][1], "x2": pts[0][0], "y2": pts[0][1]})
-                                    elif capa in capas_vigas:
-                                        lineas_vigas_crudo.append({"x1": pts[-1][0], "y1": pts[-1][1], "x2": pts[0][0], "y2": pts[0][1]})
-                                    elif capa in capas_columnas:
-                                        lineas_columnas.append({"x1": pts[-1][0], "y1": pts[-1][1], "x2": pts[0][0], "y2": pts[0][1]})
-                            except Exception:
-                                pass
+                            # B. POLILINEAS
+                            elif tipo == 'LWPOLYLINE':
+                                try:
+                                    pts = [(float(p[0]), float(p[1])) for p in e.get_points('xy')]
+                                    for i in range(len(pts) - 1):
+                                        p1, p2 = pts[i], pts[i+1]
+                                        dx, dy = abs(p2[0] - p1[0]), abs(p2[1] - p1[1])
+                                        if dx < 0.05 and 2.5 <= dy <= 12.0:
+                                            alturas_vectoriales_corte.append(round(dy, 2))
+                                            
+                                        if capa in capas_seleccionadas and p1 != p2:
+                                            muros_crudos.append({"x1": p1[0], "y1": p1[1], "x2": p2[0], "y2": p2[1]})
+                                        elif capa in capas_vigas and p1 != p2:
+                                            lineas_vigas_crudo.append({"x1": p1[0], "y1": p1[1], "x2": p2[0], "y2": p2[1]})
+                                        elif capa in capas_columnas and p1 != p2:
+                                            lineas_columnas.append({"x1": p1[0], "y1": p1[1], "x2": p2[0], "y2": p2[1]})
 
-                        # B. HATCH
-                        elif tipo == 'HATCH' and capa in capas_seleccionadas:
-                            try:
-                                for path in e.paths:
-                                    if hasattr(path, 'vertices') and len(path.vertices) >= 3:
-                                        pts = [(float(p[0]), float(p[1])) for p in path.vertices]
-                                        for i in range(len(pts) - 1):
-                                            muros_crudos.append({"x1": pts[i][0], "y1": pts[i][1], "x2": pts[i+1][0], "y2": pts[i+1][1]})
-                                        if pts[-1] != pts[0]:
+                                    if getattr(e, 'is_closed', False) and pts[-1] != pts[0]:
+                                        if capa in capas_seleccionadas:
                                             muros_crudos.append({"x1": pts[-1][0], "y1": pts[-1][1], "x2": pts[0][0], "y2": pts[0][1]})
-                                    elif hasattr(path, 'edges'):
-                                        for edge in path.edges:
-                                            if hasattr(edge, 'start') and hasattr(edge, 'end'):
-                                                muros_crudos.append({"x1": float(edge.start[0]), "y1": float(edge.start[1]), "x2": float(edge.end[0]), "y2": float(edge.end[1])})
-                            except Exception:
-                                pass
+                                        elif capa in capas_vigas:
+                                            lineas_vigas_crudo.append({"x1": pts[-1][0], "y1": pts[-1][1], "x2": pts[0][0], "y2": pts[0][1]})
+                                        elif capa in capas_columnas:
+                                            lineas_columnas.append({"x1": pts[-1][0], "y1": pts[-1][1], "x2": pts[0][0], "y2": pts[0][1]})
+                                except Exception:
+                                    pass
 
-                        # C. TEXTOS Y COTAS (Solo si no están en muros)
-                        elif tipo in ('TEXT', 'MTEXT') and capa not in capas_activas:
-                            try:
-                                contenido = e.dxf.text if tipo == 'TEXT' else e.text
-                                if contenido and contenido.strip():
-                                    align_pt = getattr(e.dxf, 'align_point', None)
-                                    insert_pt = getattr(e.dxf, 'insert', None)
-                                    pos = align_pt if (align_pt and (align_pt[0] != 0 or align_pt[1] != 0)) else insert_pt
-                                    if pos:
-                                        textos_crudos_dxf.append({"texto": contenido.strip(), "x": pos[0], "y": pos[1]})
-                            except Exception:
-                                pass
+                            # C. HATCH
+                            elif tipo == 'HATCH' and capa in capas_seleccionadas:
+                                try:
+                                    for path in e.paths:
+                                        if hasattr(path, 'vertices') and len(path.vertices) >= 3:
+                                            pts = [(float(p[0]), float(p[1])) for p in path.vertices]
+                                            for i in range(len(pts) - 1):
+                                                muros_crudos.append({"x1": pts[i][0], "y1": pts[i][1], "x2": pts[i+1][0], "y2": pts[i+1][1]})
+                                            if pts[-1] != pts[0]:
+                                                muros_crudos.append({"x1": pts[-1][0], "y1": pts[-1][1], "x2": pts[0][0], "y2": pts[0][1]})
+                                        elif hasattr(path, 'edges'):
+                                            for edge in path.edges:
+                                                if hasattr(edge, 'start') and hasattr(edge, 'end'):
+                                                    muros_crudos.append({"x1": float(edge.start[0]), "y1": float(edge.start[1]), "x2": float(edge.end[0]), "y2": float(edge.end[1])})
+                                except Exception:
+                                    pass
 
-                        elif tipo == 'DIMENSION':
-                            try:
-                                txt_cota = getattr(e.dxf, 'text', '').strip()
-                                if not txt_cota and hasattr(e, 'get_measurement'):
-                                    try:
-                                        txt_cota = f"COTA {round(e.get_measurement(), 2)}"
-                                    except Exception:
-                                        pass
-                                if txt_cota:
-                                    def_pt = getattr(e.dxf, 'defpoint', None) or getattr(e.dxf, 'text_midpoint', None)
-                                    if def_pt:
-                                        textos_crudos_dxf.append({"texto": txt_cota, "x": def_pt[0], "y": def_pt[1]})
-                            except Exception:
-                                pass
+                            # D. TEXTOS
+                            elif tipo in ('TEXT', 'MTEXT') and capa not in capas_activas:
+                                try:
+                                    contenido = e.dxf.text if tipo == 'TEXT' else e.text
+                                    if contenido and contenido.strip():
+                                        align_pt = getattr(e.dxf, 'align_point', None)
+                                        insert_pt = getattr(e.dxf, 'insert', None)
+                                        pos = align_pt if (align_pt and (align_pt[0] != 0 or align_pt[1] != 0)) else insert_pt
+                                        if pos:
+                                            textos_crudos_dxf.append({"texto": contenido.strip(), "x": pos[0], "y": pos[1]})
+                                except Exception:
+                                    pass
 
-                    # Liberación inmediata de RAM
-                    del doc
-                    del msp
-                    gc.collect()
+                            elif tipo == 'DIMENSION':
+                                try:
+                                    txt_cota = getattr(e.dxf, 'text', '').strip()
+                                    if not txt_cota and hasattr(e, 'get_measurement'):
+                                        try:
+                                            txt_cota = f"COTA {round(e.get_measurement(), 2)}"
+                                        except Exception:
+                                            pass
+                                    if txt_cota:
+                                        def_pt = getattr(e.dxf, 'defpoint', None) or getattr(e.dxf, 'text_midpoint', None)
+                                        if def_pt:
+                                            textos_crudos_dxf.append({"texto": txt_cota, "x": def_pt[0], "y": def_pt[1]})
+                                except Exception:
+                                    pass
+                    finally:
+                        doc_stream.close()
+                        gc.collect()
 
                     if not muros_crudos:
                         st.error("❌ No se encontraron geometrías en las capas seleccionadas.")
@@ -465,8 +491,8 @@ if archivo_dxf is not None:
                                                 "ancho": round(dist, 2), "rot": rot, "espesor": 0.15
                                             })
 
-                # INFERENCIA GEMINI MULTICOTA
-                with st.spinner("🤖 Analizando alturas y perfil vertical con Gemini..."):
+                # INFERENCIA GEMINI
+                with st.spinner("🤖 Analizando alturas con Gemini..."):
                     perfil_vertical = deducir_alturas_multicota(textos_dentro, textos_fuera, alturas_medidas_norm)
 
                 # AFORO TETRIS

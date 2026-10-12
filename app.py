@@ -61,7 +61,7 @@ def deducir_alturas_multicota(textos_interior: list, textos_globales: list, altu
 
     try:
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel("gemini-1.5-flash")
+        model = genai.GenerativeModel("gemini-3.8-flash")
 
         prompt = f"""
         Eres un motor ConTech experto en arquitectura comercial e ingeniería estructural.

@@ -5,6 +5,9 @@ import tempfile
 import os
 import math
 import gc
+from typing import Optional, List
+from pydantic import BaseModel, Field
+import google.generativeai as genai
 from shapely.geometry import LineString, Point, Polygon, MultiPolygon
 from shapely.ops import unary_union, polygonize, snap
 
@@ -12,7 +15,80 @@ st.set_page_config(page_title="Patty | ConTech Engine", page_icon="🏗️", lay
 st.title("🏗️ Patty - Generador Arquitectónico Paramétrico")
 st.markdown("---")
 
-# MEMORIA RAM DEL SERVIDOR (Evita leer archivos gigantes múltiples veces)
+# ==========================================
+# 1. ESQUEMA ESTRUCTURADO PARA GEMINI FLASH
+# ==========================================
+class RecintoInfo(BaseModel):
+    nombre_recinto: Optional[str] = Field(default="Espacio Principal", description="Nombre o función del espacio (ej. Sala, Salón Comercial, Comedor, SS.HH.)")
+    altura_muro: Optional[float] = Field(default=None, description="Altura libre de muros detectada en metros (ej. 2.80, 3.20)")
+    nivel_piso: Optional[float] = Field(default=0.0, description="Cota de nivel de piso terminado (NPT) en metros (ej. 0.00, 0.15, -0.05)")
+
+class InferenciaCotas(BaseModel):
+    recinto: RecintoInfo
+    altura_general: Optional[float] = Field(default=None, description="Altura estándar/global encontrada en notas generales o rótulos")
+    observacion: Optional[str] = Field(default="", description="Detalle de las cotas leídas")
+
+def deducir_alturas_con_gemini(textos_interior: list, textos_globales: list) -> tuple:
+    """
+    Envía los textos a Gemini Flash forzando salida JSON estructurada.
+    Fallback automático a (2.80m, 0.00m) si no hay API key o cotas legibles.
+    """
+    api_key = os.environ.get("GEMINI_API_KEY") or st.secrets.get("GEMINI_API_KEY", None)
+    
+    # Fallback si no hay API Key o no hay textos en el CAD
+    if not api_key or (not textos_interior and not textos_globales):
+        return 2.80, 0.00, "Espacio Principal (Default)"
+        
+    try:
+        genai.configure(api_key=api_key)
+        # Gemini 1.5 Flash o Gemini 2.0 Flash con Structured Output nativo
+        model = genai.GenerativeModel("gemini-1.5-flash")
+        
+        prompt = f"""
+        Eres un motor ConTech de análisis arquitectónico.
+        Analiza las siguientes anotaciones extraídas de un plano CAD:
+
+        - TEXTOS DENTRO DEL RECINTO HABITABLE:
+        {json.dumps(textos_interior, ensure_ascii=False)}
+
+        - TEXTOS GENERALES/EXTERIORES DEL PLANO:
+        {json.dumps(textos_globales, ensure_ascii=False)}
+
+        INSTRUCCIONES:
+        1. Identifica el nombre del recinto (ej. 'LOCAL COMERCIAL', 'RESTAURANTE', 'SALA').
+        2. Dibuja la altura de muros/cielo raso (H, H.L., H=, ALTURA LIBRE). Conviértela a metros.
+        3. Identifica niveles de piso terminado (N.P.T. o NPT).
+        4. Si no hay altura explícita en el recinto, revisa si hay una altura general en los textos exteriores.
+        """
+
+        # ACTIVACIÓN DE RESPUESTA ESTRUCTURADA ESTRICTA
+        respuesta = model.generate_content(
+            prompt,
+            generation_config=genai.GenerationConfig(
+                response_mime_type="application/json",
+                response_schema=InferenciaCotas,
+                temperature=0.0  # Determinismo máximo
+            )
+        )
+        
+        datos = json.loads(respuesta.text)
+        recinto = datos.get("recinto", {})
+        altura_general = datos.get("altura_general")
+        
+        # Selección de altura con cascada de prioridades
+        altura_final = recinto.get("altura_muro") or altura_general or 2.80
+        nivel_piso_final = recinto.get("nivel_piso") if recinto.get("nivel_piso") is not None else 0.00
+        nombre_final = recinto.get("nombre_recinto") or "Espacio Comercial"
+        
+        return round(float(altura_final), 2), round(float(nivel_piso_final), 2), nombre_final
+
+    except Exception:
+        # Resiliencia de producción: nunca rompe el pipeline
+        return 2.80, 0.00, "Espacio Comercial (Fallback)"
+
+# ==========================================
+# 2. ESTADO DE MEMORIA RAM STREAMLIT
+# ==========================================
 if 'datos_proyecto' not in st.session_state:
     st.session_state['datos_proyecto'] = None
     st.session_state['metrics'] = None
@@ -29,7 +105,7 @@ pasillo_min = 1.20
 archivo_dxf = st.file_uploader("📥 Arrastra aquí el plano CAD (.DXF)", type=['dxf'])
 
 if archivo_dxf is not None:
-    # 1. SI ES UN ARCHIVO NUEVO, LO LEEMOS UNA SOLA VEZ Y VACIAMOS RAM
+    # 1. LECTURA INICIAL DE CAPAS
     if st.session_state['nombre_archivo'] != archivo_dxf.name:
         st.session_state['nombre_archivo'] = archivo_dxf.name
         st.session_state['datos_proyecto'] = None 
@@ -41,7 +117,6 @@ if archivo_dxf is not None:
             
         with st.spinner("⏳ Analizando estructura del archivo pesado..."):
             try:
-                # Lectura estándar (sin recover)
                 doc = ezdxf.readfile(st.session_state['archivo_path'])
                 msp = doc.modelspace()
                 capas = set()
@@ -49,14 +124,13 @@ if archivo_dxf is not None:
                     capas.add(e.dxf.layer)
                 st.session_state['capas_disponibles'] = sorted(list(capas))
                 
-                # Vaciar la memoria RAM inmediatamente para que no crashee
                 del doc
                 del msp
                 gc.collect() 
             except Exception as e:
                 st.error(f"Error al leer el archivo: {e}")
 
-    # 2. UI SÚPER RÁPIDA (Traductor de Capas)
+    # 2. PROCESAMIENTO
     if st.session_state['capas_disponibles']:
         st.info(f"🔍 Detectamos {len(st.session_state['capas_disponibles'])} capas.")
         capas_seleccionadas = st.multiselect(
@@ -71,13 +145,11 @@ if archivo_dxf is not None:
                 
             try:
                 with st.spinner("🧠 Filtrando ruido y procesando 3D..."):
-                    # Volvemos a abrir el documento solo cuando damos clic a generar
                     doc = ezdxf.readfile(st.session_state['archivo_path'])
                     msp = doc.modelspace()
                     
                     muros_crudos = []
                     for e in msp.query('LINE LWPOLYLINE'):
-                        # FILTRO: Solo procesar líneas de las capas seleccionadas
                         if e.dxf.layer in capas_seleccionadas:
                             if e.dxftype() == 'LINE':
                                 p1, p2 = (e.dxf.start.x, e.dxf.start.y), (e.dxf.end.x, e.dxf.end.y)
@@ -89,7 +161,18 @@ if archivo_dxf is not None:
                                 if getattr(e, 'is_closed', False) and pts[-1] != pts[0]:
                                     muros_crudos.append({"x1": pts[-1][0], "y1": pts[-1][1], "x2": pts[0][0], "y2": pts[0][1]})
 
-                    # Vaciar RAM del CAD de inmediato
+                    # NUEVO: Extracción de textos (TEXT y MTEXT) fuera de capas de muros
+                    textos_crudos_dxf = []
+                    for t in msp.query('TEXT MTEXT'):
+                        if t.dxf.layer not in capas_seleccionadas:
+                            try:
+                                contenido = t.dxf.text if t.dxftype() == 'TEXT' else t.text
+                                if contenido and contenido.strip():
+                                    ins = t.dxf.insert
+                                    textos_crudos_dxf.append({"texto": contenido.strip(), "x": ins.x, "y": ins.y})
+                            except Exception:
+                                pass
+
                     del doc
                     del msp
                     gc.collect()
@@ -122,6 +205,19 @@ if archivo_dxf is not None:
                     
                     hab_limpia = hab_principal.simplify(0.05, preserve_topology=True)
                     area_habitable = round(hab_limpia.area, 2)
+
+                    # NUEVO: Clasificación espacial de textos (Point-in-Polygon)
+                    textos_dentro = []
+                    textos_fuera = []
+                    for t in textos_crudos_dxf:
+                        tx_norm = (t["x"] - min_x) / factor
+                        ty_norm = (t["y"] - min_y) / factor
+                        punto = Point(tx_norm, ty_norm)
+                        
+                        if hab_limpia.contains(punto):
+                            textos_dentro.append(t["texto"])
+                        else:
+                            textos_fuera.append(t["texto"])
 
                     # ESCÁNER DE VANOS
                     vanos_detectados = []
@@ -162,6 +258,12 @@ if archivo_dxf is not None:
                                             "p2": {"x": round(p2[0],2), "y": round(p2[1],2)},
                                             "ancho": round(dist, 2), "rot": rot, "espesor": espesor_real
                                         })
+
+                # NUEVO: Inferencia de Alturas con Gemini Flash (Structured Output)
+                with st.spinner("🤖 Leyendo textos y deduciendo alturas con Gemini Flash..."):
+                    altura_deducida, nivel_piso_deducido, nombre_espacio = deducir_alturas_con_gemini(
+                        textos_dentro, textos_fuera
+                    )
 
                 with st.spinner("🪑 Maximizando Aforo Comercial..."):
                     aforo_legal_max = math.floor(area_habitable / factor_area)
@@ -211,28 +313,45 @@ if archivo_dxf is not None:
                         p_simp = p.simplify(0.02, preserve_topology=True)
                         muros_export.append([{"x": round(x,2), "y": round(y,2)} for x,y in p_simp.exterior.coords])
 
+                    # Contrato de datos enriquecido con alturas paramétricas
                     datos_proyecto = {
-                        "altura_muros": 2.80,
+                        "espacio": nombre_espacio,
+                        "altura_muros": altura_deducida,
+                        "nivel_piso": nivel_piso_deducido,
                         "muros": muros_export,
                         "contorno_piso": [{"x": round(x,2), "y": round(y,2)} for x,y in hab_limpia.exterior.coords],
                         "vanos": vanos_detectados,
                         "muebles": mesas_4p + mesas_2p,
-                        "reporte": {"area_m2": area_habitable, "aforo_legal": aforo_legal_max, "asientos": asientos_totales}
+                        "reporte": {
+                            "area_m2": area_habitable, 
+                            "aforo_legal": aforo_legal_max, 
+                            "asientos": asientos_totales
+                        }
                     }
                     
                     st.session_state['datos_proyecto'] = json.dumps(datos_proyecto, indent=4)
                     st.session_state['metrics'] = {
-                        "area": area_habitable, "legal": aforo_legal_max, "asientos": asientos_totales
+                        "area": area_habitable, 
+                        "legal": aforo_legal_max, 
+                        "asientos": asientos_totales,
+                        "espacio": nombre_espacio,
+                        "altura": altura_deducida,
+                        "npt": nivel_piso_deducido
                     }
 
             except Exception as e:
                 st.error(f"❌ Error al procesar: {e}")
 
+# ==========================================
+# 3. INTERFAZ Y DESCARGA
+# ==========================================
 if st.session_state['datos_proyecto']:
     m = st.session_state['metrics']
-    col1, col2, col3 = st.columns(3)
-    col1.metric("📐 Área Útil", f"{m['area']} m²")
-    col2.metric("🏛️ Aforo Legal Máx.", f"{m['legal']} Pax")
-    col3.metric("🪑 Asientos Diseñados", f"{m['asientos']} Pax")
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("🏷️ Espacio", f"{m['espacio']}")
+    col2.metric("📐 Altura Muros (H)", f"{m['altura']} m")
+    col3.metric("🏛️ Aforo Legal", f"{m['legal']} Pax")
+    col4.metric("🪑 Asientos Diseñados", f"{m['asientos']} Pax")
 
+    st.success(f"Cota N.P.T. detectada: {m['npt']} m | Área Útil: {m['area']} m²")
     st.download_button("📦 Descargar JSON de Patty", data=st.session_state['datos_proyecto'], file_name="proyecto.json")

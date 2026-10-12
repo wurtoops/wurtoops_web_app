@@ -74,7 +74,7 @@ def auto_clasificar_capas(todas_las_capas: list) -> dict:
 
     try:
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel("gemini-1.5-flash")
+        model = genai.GenerativeModel("gemini-3.8-flash")
 
         prompt = f"""
         Analiza esta lista de capas de un plano CAD y clasifícalas:

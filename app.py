@@ -16,7 +16,7 @@ st.title("🏗️ Patty - Generador Arquitectónico Paramétrico")
 st.markdown("---")
 
 # ==============================================================================
-# 1. ESQUEMA ESTRICTO GEMINI FLASH (100% PROTOBUF SAFE)
+# 1. ESQUEMA ESTRICTO GEMINI FLASH
 # ==============================================================================
 class RecintoInfo(BaseModel):
     nombre_recinto: str = Field(
@@ -50,7 +50,7 @@ def deducir_alturas_con_gemini(textos_interior: list, textos_globales: list) -> 
 
     try:
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel("gemini-3.8-flash")
+        model = genai.GenerativeModel("gemini-1.5-flash")
 
         prompt = f"""
         Eres un motor ConTech experto en análisis arquitectónico, planos y cortes de construcción.
@@ -125,7 +125,7 @@ if archivo_dxf is not None:
                 doc = ezdxf.readfile(st.session_state['archivo_path'])
                 msp = doc.modelspace()
                 capas = set()
-                for e in msp.query('LINE LWPOLYLINE'):
+                for e in msp.query('LINE LWPOLYLINE HATCH'):
                     capas.add(e.dxf.layer)
                 st.session_state['capas_disponibles'] = sorted(list(capas))
                 
@@ -137,22 +137,32 @@ if archivo_dxf is not None:
 
     if st.session_state['capas_disponibles']:
         st.info(f"🔍 Detectamos {len(st.session_state['capas_disponibles'])} capas.")
-        capas_seleccionadas = st.multiselect(
-            "👉 Selecciona SOLO la capa de los MUROS:",
-            st.session_state['capas_disponibles']
-        )
+        
+        col_ui_1, col_ui_2 = st.columns(2)
+        with col_ui_1:
+            capas_seleccionadas = st.multiselect(
+                "👉 Capas del Recinto (Muros, Límites de Concesión, Áreas, Hatch):",
+                st.session_state['capas_disponibles']
+            )
+        with col_ui_2:
+            capas_columnas = st.multiselect(
+                "🏛️ (Opcional) Capas de Columnas / Obstáculos estructurales:",
+                [c for c in st.session_state['capas_disponibles'] if c not in capas_seleccionadas]
+            )
 
         if st.button("🚀 Procesar Arquitectura Limpia"):
             if not capas_seleccionadas:
-                st.warning("Debes seleccionar al menos una capa.")
+                st.warning("Debes seleccionar al menos una capa de recinto/muros.")
                 st.stop()
                 
             try:
-                with st.spinner("🧠 Filtrando geometría y extrayendo anotaciones..."):
+                with st.spinner("🧠 Filtrando geometría, tramados y anotaciones..."):
                     doc = ezdxf.readfile(st.session_state['archivo_path'])
                     msp = doc.modelspace()
                     
                     muros_crudos = []
+                    
+                    # 1. LINE y LWPOLYLINE
                     for e in msp.query('LINE LWPOLYLINE'):
                         if e.dxf.layer in capas_seleccionadas:
                             if e.dxftype() == 'LINE':
@@ -165,7 +175,42 @@ if archivo_dxf is not None:
                                 if getattr(e, 'is_closed', False) and pts[-1] != pts[0]:
                                     muros_crudos.append({"x1": pts[-1][0], "y1": pts[-1][1], "x2": pts[0][0], "y2": pts[0][1]})
 
-                    # EXTRACCIÓN DE TEXTOS, COTAS Y DIRECTRICES
+                    # 2. HATCH (Tramas achuradas como RC-Hatch)
+                    for h in msp.query('HATCH'):
+                        if h.dxf.layer in capas_seleccionadas:
+                            try:
+                                for path in h.paths:
+                                    if hasattr(path, 'vertices') and len(path.vertices) >= 3:
+                                        pts = [(float(p[0]), float(p[1])) for p in path.vertices]
+                                        for i in range(len(pts) - 1):
+                                            muros_crudos.append({"x1": pts[i][0], "y1": pts[i][1], "x2": pts[i+1][0], "y2": pts[i+1][1]})
+                                        if pts[-1] != pts[0]:
+                                            muros_crudos.append({"x1": pts[-1][0], "y1": pts[-1][1], "x2": pts[0][0], "y2": pts[0][1]})
+                                    elif hasattr(path, 'edges'):
+                                        for edge in path.edges:
+                                            if hasattr(edge, 'start') and hasattr(edge, 'end'):
+                                                muros_crudos.append({
+                                                    "x1": float(edge.start[0]), "y1": float(edge.start[1]),
+                                                    "x2": float(edge.end[0]), "y2": float(edge.end[1])
+                                                })
+                            except Exception:
+                                pass
+
+                    # 3. COLUMNAS EXTRAÍDAS (si se seleccionaron capas de columnas)
+                    lineas_columnas = []
+                    if capas_columnas:
+                        for e in msp.query('LINE LWPOLYLINE'):
+                            if e.dxf.layer in capas_columnas:
+                                if e.dxftype() == 'LINE':
+                                    lineas_columnas.append({"x1": e.dxf.start.x, "y1": e.dxf.start.y, "x2": e.dxf.end.x, "y2": e.dxf.end.y})
+                                elif e.dxftype() == 'LWPOLYLINE':
+                                    pts = [(float(p[0]), float(p[1])) for p in e.get_points('xy')]
+                                    for i in range(len(pts) - 1):
+                                        lineas_columnas.append({"x1": pts[i][0], "y1": pts[i][1], "x2": pts[i+1][0], "y2": pts[i+1][1]})
+                                    if getattr(e, 'is_closed', False) and pts[-1] != pts[0]:
+                                        lineas_columnas.append({"x1": pts[-1][0], "y1": pts[-1][1], "x2": pts[0][0], "y2": pts[0][1]})
+
+                    # 4. TEXTOS, COTAS Y DIRECTRICES
                     textos_crudos_dxf = []
                     for t in msp.query('TEXT MTEXT'):
                         if t.dxf.layer not in capas_seleccionadas:
@@ -214,7 +259,7 @@ if archivo_dxf is not None:
                     gc.collect()
 
                     if not muros_crudos:
-                        st.error("❌ No se encontraron líneas en las capas seleccionadas.")
+                        st.error("❌ No se encontraron geometrías en las capas seleccionadas.")
                         st.stop()
 
                     todos_x = [m['x1'] for m in muros_crudos] + [m['x2'] for m in muros_crudos]
@@ -223,9 +268,13 @@ if archivo_dxf is not None:
                     dim_mayor = max(max(todos_x) - min_x, max(todos_y) - min_y)
                     factor = 1.0 if dim_mayor < 200 else (100.0 if dim_mayor < 25000 else 1000.0)
 
-                    lineas_limpias = [LineString([((m['x1']-min_x)/factor, (m['y1']-min_y)/factor), ((m['x2']-min_x)/factor, (m['y2']-min_y)/factor)]) for m in muros_crudos if m['x1']!=m['x2'] or m['y1']!=m['y2']]
+                    lineas_limpias = [
+                        LineString([((m['x1']-min_x)/factor, (m['y1']-min_y)/factor), 
+                                    ((m['x2']-min_x)/factor, (m['y2']-min_y)/factor)]) 
+                        for m in muros_crudos if m['x1']!=m['x2'] or m['y1']!=m['y2']
+                    ]
 
-                    # TOLERANCIA DE SELLADO AUMENTADA A 0.25m PARA CERRAR ESQUINAS ABIERTAS
+                    # Tolerancia de snapping
                     red_unida = unary_union(snap(unary_union(lineas_limpias), unary_union(lineas_limpias), tolerance=0.25))
                     
                     muros_solidos = [p for p in polygonize(red_unida) if p.is_valid and p.buffer(-0.08).is_empty and p.area > 0.05]
@@ -238,15 +287,37 @@ if archivo_dxf is not None:
                     vacios = envoltura.difference(union_muros)
                     
                     todos_vacios = [g for g in (vacios.geoms if hasattr(vacios, 'geoms') else [vacios]) if isinstance(g, Polygon)]
-                    areas_detectadas = [round(g.area, 2) for g in todos_vacios]
-
+                    
+                    # ==========================================================
+                    # FUSIÓN INTELIGENTE DE RECINTOS CONTIGUOS (MODO RETAIL)
+                    # ==========================================================
                     cands = [g for g in todos_vacios if g.area > 2.0]
-                    hab_principal = max(cands, key=lambda h: h.area) if cands else (max(todos_vacios, key=lambda h: h.area) if todos_vacios else envoltura)
+                    if cands:
+                        # Une polígonos que comparten bordes (ej. trapecio + cuerpo inferior)
+                        fusion = unary_union(cands)
+                        if isinstance(fusion, Polygon):
+                            hab_principal = fusion
+                        elif isinstance(fusion, MultiPolygon):
+                            # Si están separados, toma el conjunto contiguo más grande
+                            hab_principal = max(fusion.geoms, key=lambda h: h.area)
+                        else:
+                            hab_principal = max(cands, key=lambda h: h.area)
+                    else:
+                        hab_principal = max(todos_vacios, key=lambda h: h.area) if todos_vacios else envoltura
+
+                    # ==========================================================
+                    # SUSTRACCIÓN DE COLUMNAS (PERFORAR HUECOS EN EL SUELO)
+                    # ==========================================================
+                    if lineas_columnas:
+                        col_geom = [LineString([((m['x1']-min_x)/factor, (m['y1']-min_y)/factor), ((m['x2']-min_x)/factor, (m['y2']-min_y)/factor)]) for m in lineas_columnas]
+                        col_polys = [p for p in polygonize(unary_union(col_geom)) if p.is_valid and p.area > 0.04]
+                        if col_polys:
+                            hab_principal = hab_principal.difference(unary_union(col_polys))
                     
                     hab_limpia = hab_principal.simplify(0.05, preserve_topology=True)
                     area_habitable = round(hab_limpia.area, 2)
 
-                    # CLASIFICACIÓN ESPACIAL DE TEXTOS
+                    # CLASIFICACIÓN DE TEXTOS
                     hab_tolerancia = hab_limpia.buffer(0.40)
                     textos_dentro = []
                     textos_fuera = []
@@ -260,45 +331,37 @@ if archivo_dxf is not None:
                         else:
                             textos_fuera.append(t["texto"])
 
-                    # ESCÁNER SEMÁNTICO DE VANOS (RAYCAST)
+                    # ESCÁNER DE VANOS
                     vanos_detectados = []
-                    coords_per = list(hab_limpia.exterior.coords)
+                    poligono_exterior = hab_limpia.exterior if hasattr(hab_limpia, 'exterior') else (hab_limpia.geoms[0].exterior if hasattr(hab_limpia, 'geoms') else None)
                     
-                    for i in range(len(coords_per) - 1):
-                        p1, p2 = coords_per[i], coords_per[i+1]
-                        dist = math.hypot(p2[0]-p1[0], p2[1]-p1[1])
-                        
-                        if 0.70 <= dist <= 2.80:
-                            segmento = LineString([p1, p2])
-                            if segmento.intersection(union_muros).length < (dist * 0.20):
-                                pm = Point((p1[0]+p2[0])/2.0, (p1[1]+p2[1])/2.0)
-                                
-                                nx, ny = -(p2[1]-p1[1])/dist, (p2[0]-p1[0])/dist
-                                test_pt = Point(pm.x + nx*0.2, pm.y + ny*0.2)
-                                if hab_limpia.contains(test_pt):
-                                    nx, ny = -nx, -ny
-                                    
-                                rayo = LineString([(pm.x, pm.y), (pm.x + nx*1.20, pm.y + ny*1.20)])
-                                if rayo.intersection(union_muros).length < 0.1:
-                                    rot = round(math.degrees(math.atan2(p2[1]-p1[1], p2[0]-p1[0])), 1)
-                                    
-                                    espesor_real = 0.15
-                                    for poly in muros_solidos:
-                                        if poly.distance(pm) < 0.4:
-                                            aprox = poly.area / (poly.length / 2.0)
-                                            estandares = [0.10, 0.15, 0.20, 0.25, 0.30]
-                                            espesor_real = min(estandares, key=lambda x: abs(x - aprox))
-                                            break
-                                    
-                                    tipo_vano = "puerta" if 0.75 <= dist <= 1.30 else "ventana"
+                    if poligono_exterior:
+                        coords_per = list(poligono_exterior.coords)
+                        for i in range(len(coords_per) - 1):
+                            p1, p2 = coords_per[i], coords_per[i+1]
+                            dist = math.hypot(p2[0]-p1[0], p2[1]-p1[1])
+                            
+                            if 0.70 <= dist <= 2.80:
+                                segmento = LineString([p1, p2])
+                                if segmento.intersection(union_muros).length < (dist * 0.20):
+                                    pm = Point((p1[0]+p2[0])/2.0, (p1[1]+p2[1])/2.0)
+                                    nx, ny = -(p2[1]-p1[1])/dist, (p2[0]-p1[0])/dist
+                                    test_pt = Point(pm.x + nx*0.2, pm.y + ny*0.2)
+                                    if hab_limpia.contains(test_pt):
+                                        nx, ny = -nx, -ny
+                                        
+                                    rayo = LineString([(pm.x, pm.y), (pm.x + nx*1.20, pm.y + ny*1.20)])
+                                    if rayo.intersection(union_muros).length < 0.1:
+                                        rot = round(math.degrees(math.atan2(p2[1]-p1[1], p2[0]-p1[0])), 1)
+                                        tipo_vano = "puerta" if 0.75 <= dist <= 1.30 else "ventana"
 
-                                    if not any(math.hypot(pm.x - v['cx'], pm.y - v['cy']) < 0.5 for v in vanos_detectados):
-                                        vanos_detectados.append({
-                                            "tipo": tipo_vano, "cx": pm.x, "cy": pm.y,
-                                            "p1": {"x": round(p1[0],2), "y": round(p1[1],2)},
-                                            "p2": {"x": round(p2[0],2), "y": round(p2[1],2)},
-                                            "ancho": round(dist, 2), "rot": rot, "espesor": espesor_real
-                                        })
+                                        if not any(math.hypot(pm.x - v['cx'], pm.y - v['cy']) < 0.5 for v in vanos_detectados):
+                                            vanos_detectados.append({
+                                                "tipo": tipo_vano, "cx": pm.x, "cy": pm.y,
+                                                "p1": {"x": round(p1[0],2), "y": round(p1[1],2)},
+                                                "p2": {"x": round(p2[0],2), "y": round(p2[1],2)},
+                                                "ancho": round(dist, 2), "rot": rot, "espesor": 0.15
+                                            })
 
                 with st.spinner("🤖 Leyendo cotas y deduciendo alturas con Gemini Flash..."):
                     altura_deducida, nivel_piso_deducido, nombre_espacio = deducir_alturas_con_gemini(
@@ -353,12 +416,19 @@ if archivo_dxf is not None:
                         p_simp = p.simplify(0.02, preserve_topology=True)
                         muros_export.append([{"x": round(x,2), "y": round(y,2)} for x,y in p_simp.exterior.coords])
 
+                    # Contorno de piso unificado (soporta MultiPolygon si aplica)
+                    coords_contorno = []
+                    if hasattr(hab_limpia, 'exterior'):
+                        coords_contorno = [{"x": round(x,2), "y": round(y,2)} for x,y in hab_limpia.exterior.coords]
+                    elif hasattr(hab_limpia, 'geoms'):
+                        coords_contorno = [{"x": round(x,2), "y": round(y,2)} for x,y in hab_limpia.geoms[0].exterior.coords]
+
                     datos_proyecto = {
                         "espacio": nombre_espacio,
                         "altura_muros": altura_deducida,
                         "nivel_piso": nivel_piso_deducido,
                         "muros": muros_export,
-                        "contorno_piso": [{"x": round(x,2), "y": round(y,2)} for x,y in hab_limpia.exterior.coords],
+                        "contorno_piso": coords_contorno,
                         "vanos": vanos_detectados,
                         "muebles": mesas_4p + mesas_2p,
                         "reporte": {
@@ -375,23 +445,14 @@ if archivo_dxf is not None:
                         "asientos": asientos_totales,
                         "espacio": nombre_espacio,
                         "altura": altura_deducida,
-                        "npt": nivel_piso_deducido,
-                        "total_textos": len(textos_crudos_dxf),
-                        "textos_dentro": textos_dentro,
-                        "textos_fuera": textos_fuera,
-                        "telemetria": {
-                            "num_muros": len(muros_crudos),
-                            "dim_mayor": round(dim_mayor, 2),
-                            "factor": factor,
-                            "areas_vacios": areas_detectadas
-                        }
+                        "npt": nivel_piso_deducido
                     }
 
             except Exception as e:
                 st.error(f"❌ Error al procesar: {e}")
 
 # ==============================================================================
-# 3. INTERFAZ Y TELEMETRÍA EN PANTALLA
+# 3. INTERFAZ Y DESCARGA
 # ==============================================================================
 if st.session_state['datos_proyecto']:
     m = st.session_state['metrics']
@@ -402,13 +463,4 @@ if st.session_state['datos_proyecto']:
     col4.metric("🪑 Asientos Diseñados", f"{m['asientos']} Pax")
 
     st.success(f"Cota N.P.T.: {m['npt']} m | Área Útil: {m['area']} m²")
-
-    # TELEMETRÍA TÉCNICA VISIBLE
-    t = m['telemetria']
-    st.info(f"📊 **Telemetría Geométrica:** Líneas leídas: {t['num_muros']} | Dimensión mayor: {t['dim_mayor']} (Factor escala: {t['factor']}) | Polígonos cerrados detectados: {t['areas_vacios']} m²")
-
-    with st.expander(f"🔍 Auditoría de Textos y Cotas CAD ({m['total_textos']} elementos extraídos)"):
-        st.write("**Anotaciones dentro del recinto:**", m['textos_dentro'] if m['textos_dentro'] else "Ninguno")
-        st.write("**Anotaciones generales y cotas del plano:**", m['textos_fuera'][:30] if m['textos_fuera'] else "Ninguno")
-
     st.download_button("📦 Descargar JSON de Patty", data=st.session_state['datos_proyecto'], file_name="proyecto.json")

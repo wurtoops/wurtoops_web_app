@@ -15,49 +15,66 @@ st.set_page_config(page_title="Patty | ConTech Engine", page_icon="🏗️", lay
 st.title("🏗️ Patty - Generador Arquitectónico Paramétrico")
 st.markdown("---")
 
-# ==========================================
-# 1. CONTRATO DE DATOS Y SCHEMA PARA GEMINI
-# ==========================================
+# ==============================================================================
+# 1. CONTRATO DE DATOS Y ESQUEMA ESTRUCTURADO PARA GEMINI FLASH
+# ==============================================================================
 class RecintoInfo(BaseModel):
-    nombre_recinto: Optional[str] = Field(default="Espacio Principal", description="Nombre o función del espacio (ej. Sala, Salón Comercial, Comedor, SS.HH.)")
-    altura_muro: Optional[float] = Field(default=None, description="Altura libre de muros detectada en metros (ej. 2.80, 3.20)")
-    nivel_piso: Optional[float] = Field(default=0.0, description="Cota de nivel de piso terminado (NPT) en metros (ej. 0.00, 0.15, -0.05)")
+    nombre_recinto: Optional[str] = Field(
+        default="Espacio Comercial", 
+        description="Nombre del espacio o locatario detectado (ej. MC DONALD'S, LOCAL COMERCIAL, RESTAURANTE, SALA)"
+    )
+    altura_muro: Optional[float] = Field(
+        default=None, 
+        description="Altura libre detectada en metros o cota vertical entre piso y losa/viga (ej. 4.50, 2.80)"
+    )
+    nivel_piso: Optional[float] = Field(
+        default=0.0, 
+        description="Cota de nivel de piso terminado (NPT) en metros (ej. 5.95, 6.00, 0.00)"
+    )
 
 class InferenciaCotas(BaseModel):
     recinto: RecintoInfo
-    altura_general: Optional[float] = Field(default=None, description="Altura estándar/global encontrada en notas generales o rótulos")
-    observacion: Optional[str] = Field(default="", description="Detalle de las cotas leídas")
+    altura_general: Optional[float] = Field(
+        default=None, 
+        description="Altura global o estándar detectada en notas o cotas"
+    )
+    observacion: Optional[str] = Field(
+        default="", 
+        description="Detalle de las cotas encontradas en el plano o corte"
+    )
 
 def deducir_alturas_con_gemini(textos_interior: list, textos_globales: list) -> tuple:
     """
-    Envía los textos a Gemini Flash forzando salida JSON estructurada.
-    Fallback automático a (2.80m, 0.00m) si no hay API key o cotas legibles.
+    Envía las anotaciones y cotas a Gemini Flash con validación JSON estricta.
     """
     api_key = os.environ.get("GEMINI_API_KEY") or st.secrets.get("GEMINI_API_KEY", None)
     
-    # Si no hay textos en absoluto o no hay API Key
-    if not api_key or (not textos_interior and not textos_globales):
-        return 2.80, 0.00, "Espacio Principal (Default)"
-        
+    if not api_key:
+        st.warning("⚠️ No se encontró GEMINI_API_KEY en Streamlit Secrets.")
+        return 2.80, 0.00, "Sin API Key (Default)"
+
+    if not textos_interior and not textos_globales:
+        return 2.80, 0.00, "Sin textos en CAD (Default)"
+
     try:
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel("gemini-1.5-flash")
-        
-        prompt = f"""
-        Eres un motor ConTech de análisis arquitectónico.
-        Analiza las siguientes anotaciones extraídas de un plano CAD:
+        model = genai.GenerativeModel("gemini-3.8-flash")
 
-        - TEXTOS DEL RECINTO INTERIOR:
+        prompt = f"""
+        Eres un motor ConTech experto en análisis arquitectónico, planos y cortes de construcción.
+        Analiza las anotaciones, cotas y directrices extraídas de este archivo CAD:
+
+        - ANOTACIONES ASOCIADAS AL RECINTO:
         {json.dumps(textos_interior, ensure_ascii=False)}
 
-        - TEXTOS GENERALES/EXTERIORES DEL PLANO:
+        - ANOTACIONES Y COTAS GENERALES DEL DIBUJO/CORTE:
         {json.dumps(textos_globales, ensure_ascii=False)}
 
-        INSTRUCCIONES:
-        1. Identifica el nombre del recinto arquitectónico principal (ej. 'LOCAL COMERCIAL', 'RESTAURANTE', 'SALA').
-        2. Deduce la altura de muros o cielo raso (H, H.L., H=, ALTURA LIBRE). Conviértela a metros.
-        3. Identifica niveles de piso terminado (N.P.T. o NPT).
-        4. Si no hay altura explícita en el recinto interior, búscala en los textos generales del plano.
+        INSTRUCCIONES CLAVE:
+        1. Identifica el nombre del recinto o marca/locatario (ej. 'MC DONALD\'S', 'LOCAL COMERCIAL', 'TABIQUE LOCATARIO').
+        2. Deduce la altura libre vertical entre piso y losa/viga (ej. cotas dimensionales como '4.50', '4.5', 'COTA 4.50', H=4.50). Conviértela a número flotante en metros.
+        3. Identifica niveles de piso terminado (ej. 'NPT +5.95', 'NPT +6.00'). Si hay varios, toma el nivel interior o dominante.
+        4. Si encuentras cotas dimensionales numéricas puras como 'COTA 4.5' o '4.50', evalúa si corresponden a la altura del espacio.
         """
 
         respuesta = model.generate_content(
@@ -68,24 +85,24 @@ def deducir_alturas_con_gemini(textos_interior: list, textos_globales: list) -> 
                 temperature=0.0
             )
         )
-        
+
         datos = json.loads(respuesta.text)
         recinto = datos.get("recinto", {})
         altura_general = datos.get("altura_general")
-        
-        # Selección paramétrica con cascada de prioridades
+
         altura_final = recinto.get("altura_muro") or altura_general or 2.80
         nivel_piso_final = recinto.get("nivel_piso") if recinto.get("nivel_piso") is not None else 0.00
         nombre_final = recinto.get("nombre_recinto") or "Espacio Comercial"
-        
+
         return round(float(altura_final), 2), round(float(nivel_piso_final), 2), nombre_final
 
-    except Exception:
-        return 2.80, 0.00, "Espacio Comercial (Fallback)"
+    except Exception as e:
+        st.error(f"❌ Error al consultar Gemini API: {e}")
+        return 2.80, 0.00, "Error en Gemini (Fallback)"
 
-# ==========================================
-# 2. ESTADO DE MEMORIA RAM EN STREAMLIT
-# ==========================================
+# ==============================================================================
+# 2. MEMORIA RAM EFÍMERA EN STREAMLIT
+# ==============================================================================
 if 'datos_proyecto' not in st.session_state:
     st.session_state['datos_proyecto'] = None
     st.session_state['metrics'] = None
@@ -102,7 +119,7 @@ pasillo_min = 1.20
 archivo_dxf = st.file_uploader("📥 Arrastra aquí el plano CAD (.DXF)", type=['dxf'])
 
 if archivo_dxf is not None:
-    # 1. LECTURA INICIAL EFÍMERA
+    # 1. LECTURA INICIAL DE CAPAS (Limpia RAM de inmediato)
     if st.session_state['nombre_archivo'] != archivo_dxf.name:
         st.session_state['nombre_archivo'] = archivo_dxf.name
         st.session_state['datos_proyecto'] = None 
@@ -127,7 +144,7 @@ if archivo_dxf is not None:
             except Exception as e:
                 st.error(f"Error al leer el archivo: {e}")
 
-    # 2. UI Y PROCESAMIENTO
+    # 2. PROCESAMIENTO GEOMÉTRICO Y SEMÁNTICO
     if st.session_state['capas_disponibles']:
         st.info(f"🔍 Detectamos {len(st.session_state['capas_disponibles'])} capas.")
         capas_seleccionadas = st.multiselect(
@@ -141,7 +158,7 @@ if archivo_dxf is not None:
                 st.stop()
                 
             try:
-                with st.spinner("🧠 Filtrando ruido y procesando 3D..."):
+                with st.spinner("🧠 Filtrando geometría y extrayendo anotaciones..."):
                     doc = ezdxf.readfile(st.session_state['archivo_path'])
                     msp = doc.modelspace()
                     
@@ -158,8 +175,12 @@ if archivo_dxf is not None:
                                 if getattr(e, 'is_closed', False) and pts[-1] != pts[0]:
                                     muros_crudos.append({"x1": pts[-1][0], "y1": pts[-1][1], "x2": pts[0][0], "y2": pts[0][1]})
 
-                    # EXTRACCIÓN AVANZADA DE TEXTOS (Soporta inserción centrada de AutoCAD)
+                    # ==========================================================
+                    # EXTRACCIÓN AVANZADA: TEXT, MTEXT, DIMENSION Y MULTILEADER
+                    # ==========================================================
                     textos_crudos_dxf = []
+
+                    # A. Textos planos (TEXT y MTEXT)
                     for t in msp.query('TEXT MTEXT'):
                         if t.dxf.layer not in capas_seleccionadas:
                             try:
@@ -167,19 +188,46 @@ if archivo_dxf is not None:
                                 if contenido and contenido.strip():
                                     align_pt = getattr(t.dxf, 'align_point', None)
                                     insert_pt = getattr(t.dxf, 'insert', None)
-                                    
-                                    # En AutoCAD, textos centrados usan align_point
-                                    if align_pt and (align_pt[0] != 0 or align_pt[1] != 0):
-                                        px, py = align_pt[0], align_pt[1]
-                                    elif insert_pt:
-                                        px, py = insert_pt[0], insert_pt[1]
-                                    else:
-                                        continue
-                                        
-                                    textos_crudos_dxf.append({"texto": contenido.strip(), "x": px, "y": py})
+                                    pos = align_pt if (align_pt and (align_pt[0] != 0 or align_pt[1] != 0)) else insert_pt
+                                    if pos:
+                                        textos_crudos_dxf.append({"texto": contenido.strip(), "x": pos[0], "y": pos[1]})
                             except Exception:
                                 pass
 
+                    # B. Cotas Dimensionales (DIMENSION) -> Captura cotas como "4.50"
+                    for d in msp.query('DIMENSION'):
+                        try:
+                            txt_cota = getattr(d.dxf, 'text', '').strip()
+                            if not txt_cota and hasattr(d, 'get_measurement'):
+                                try:
+                                    med = round(d.get_measurement(), 2)
+                                    txt_cota = f"COTA {med}"
+                                except Exception:
+                                    pass
+                            
+                            if txt_cota:
+                                def_pt = getattr(d.dxf, 'defpoint', None) or getattr(d.dxf, 'text_midpoint', None)
+                                if def_pt:
+                                    textos_crudos_dxf.append({"texto": txt_cota, "x": def_pt[0], "y": def_pt[1]})
+                        except Exception:
+                            pass
+
+                    # C. Directrices (MULTILEADER) -> Captura "NPT +5.95" y flechas
+                    for ml in msp.query('MULTILEADER'):
+                        try:
+                            context = getattr(ml, 'context', None)
+                            txt_ml = ""
+                            if context and hasattr(context, 'm_text') and context.m_text:
+                                txt_ml = getattr(context.m_text, 'raw_text', '') or getattr(context.m_text, 'default_text', '')
+                            if not txt_ml:
+                                txt_ml = getattr(ml.dxf, 'text', '')
+                            
+                            if txt_ml and txt_ml.strip():
+                                textos_crudos_dxf.append({"texto": txt_ml.strip(), "x": 0, "y": 0})
+                        except Exception:
+                            pass
+
+                    # Liberación inmediata de RAM del CAD
                     del doc
                     del msp
                     gc.collect()
@@ -213,8 +261,8 @@ if archivo_dxf is not None:
                     hab_limpia = hab_principal.simplify(0.05, preserve_topology=True)
                     area_habitable = round(hab_limpia.area, 2)
 
-                    # CLASIFICACIÓN ESPACIAL DE TEXTOS (Con tolerancia de borde)
-                    hab_tolerancia = hab_limpia.buffer(0.30)
+                    # CLASIFICACIÓN ESPACIAL DE TEXTOS
+                    hab_tolerancia = hab_limpia.buffer(0.40)
                     textos_dentro = []
                     textos_fuera = []
                     for t in textos_crudos_dxf:
@@ -227,7 +275,7 @@ if archivo_dxf is not None:
                         else:
                             textos_fuera.append(t["texto"])
 
-                    # ESCÁNER DE VANOS (RAYCAST)
+                    # ESCÁNER SEMÁNTICO DE VANOS (RAYCAST)
                     vanos_detectados = []
                     coords_per = list(hab_limpia.exterior.coords)
                     
@@ -268,12 +316,12 @@ if archivo_dxf is not None:
                                         })
 
                 # INFERENCIA SEMÁNTICA CON GEMINI FLASH
-                with st.spinner("🤖 Leyendo textos y deduciendo alturas con Gemini Flash..."):
+                with st.spinner("🤖 Leyendo cotas y deduciendo alturas con Gemini Flash..."):
                     altura_deducida, nivel_piso_deducido, nombre_espacio = deducir_alturas_con_gemini(
                         textos_dentro, textos_fuera
                     )
 
-                # ALGORITMO TETRIS (AFORO COMERCIAL)
+                # OPTIMIZADOR DE AFORO (ALGORITMO TETRIS)
                 with st.spinner("🪑 Maximizando Aforo Comercial..."):
                     aforo_legal_max = math.floor(area_habitable / factor_area)
                     mesas_4p, mesas_2p = [], []
@@ -354,9 +402,9 @@ if archivo_dxf is not None:
             except Exception as e:
                 st.error(f"❌ Error al procesar: {e}")
 
-# ==========================================
-# 3. DASHBOARD Y DESCARGA
-# ==========================================
+# ==============================================================================
+# 3. INTERFAZ, AUDITORÍA Y DESCARGA
+# ==============================================================================
 if st.session_state['datos_proyecto']:
     m = st.session_state['metrics']
     col1, col2, col3, col4 = st.columns(4)
@@ -367,9 +415,8 @@ if st.session_state['datos_proyecto']:
 
     st.success(f"Cota N.P.T.: {m['npt']} m | Área Útil: {m['area']} m²")
 
-    # AUDITORÍA DE TEXTOS EN PANTALLA
-    with st.expander(f"🔍 Auditoría de Textos CAD ({m['total_textos']} textos extraídos)"):
-        st.write("**Textos detectados dentro del recinto:**", m['textos_dentro'] if m['textos_dentro'] else "Ninguno")
-        st.write("**Textos detectados en el resto del plano:**", m['textos_fuera'][:25] if m['textos_fuera'] else "Ninguno")
+    with st.expander(f"🔍 Auditoría de Textos y Cotas CAD ({m['total_textos']} elementos extraídos)"):
+        st.write("**Anotaciones dentro del recinto:**", m['textos_dentro'] if m['textos_dentro'] else "Ninguno")
+        st.write("**Anotaciones generales y cotas del plano:**", m['textos_fuera'][:30] if m['textos_fuera'] else "Ninguno")
 
     st.download_button("📦 Descargar JSON de Patty", data=st.session_state['datos_proyecto'], file_name="proyecto.json")

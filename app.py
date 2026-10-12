@@ -53,7 +53,7 @@ def deducir_alturas_con_gemini(textos_interior: list, textos_globales: list) -> 
 
     try:
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel("gemini-1.5-flash")
+        model = genai.GenerativeModel("gemini-3.8-flash")
 
         prompt = f"""
         Eres un motor ConTech experto en análisis arquitectónico, planos y cortes de construcción.

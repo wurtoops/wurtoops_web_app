@@ -219,6 +219,9 @@ if archivo_dxf is not None:
                         else:
                             textos_fuera.append(t["texto"])
 
+                    # 👉 PEGA ESTA LÍNEA AQUÍ (con la misma sangría):
+                    st.info(f"🔍 Diagnóstico: API Key presente: {bool(os.environ.get('GEMINI_API_KEY') or st.secrets.get('GEMINI_API_KEY'))} | Textos encontrados: {len(textos_crudos_dxf)} (Dentro: {len(textos_dentro)}, Fuera: {len(textos_fuera)})")
+
                     # ESCÁNER DE VANOS
                     vanos_detectados = []
                     coords_per = list(hab_limpia.exterior.coords)

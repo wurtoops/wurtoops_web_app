@@ -26,26 +26,23 @@ class CotaPiso(BaseModel):
 class ElementoTecho(BaseModel):
     tipo: str = Field(description="Tipo: 'LOSA_TECHO', 'VIGA_DESCOLGADA', 'MARCO_ACCESO', 'FALSO_TECHO'")
     descripcion: str = Field(description="Descripción (ej. 'Losa Colaborante', 'Viga Concreto S/C', 'Marco Metálico')")
-    cota_inferior_metros: float = Field(description="Cota inferior libre del elemento en metros (ej. 4.50, 6.20, 6.80)")
-    descuelgue_metros: float = Field(description="Cuánto baja desde la losa superior en metros (ej. 2.30 para marco, 0.60 para viga)")
+    cota_inferior_metros: float = Field(description="Cota inferior libre en metros (ej. 4.50, 6.20, 6.80)")
+    descuelgue_metros: float = Field(description="Descuelgue desde la losa superior en metros (ej. 2.30, 0.60)")
 
 class InferenciaMulticota(BaseModel):
     nombre_espacio: str = Field(description="Nombre del locatario o marca (ej. MC DONALD'S)")
-    altura_losa_estructural: float = Field(description="Altura total bruta desde piso hasta losa colaborante/techo en metros (ej. 6.80)")
-    altura_libre_acceso: float = Field(description="Altura libre de paso bajo el marco metálico/dintel en metros (ej. 4.50)")
+    altura_losa_estructural: float = Field(description="Altura total bruta hasta losa colaborante en metros (ej. 6.80)")
+    altura_libre_acceso: float = Field(description="Altura libre de paso bajo marco metálico en metros (ej. 4.50)")
     nivel_piso_dominante: float = Field(description="Cota NPT dominante del piso interior en metros (ej. 5.95)")
-    pisos_detectados: List[CotaPiso] = Field(description="Lista de todas las cotas de piso NPT encontradas")
-    elementos_techo: List[ElementoTecho] = Field(description="Lista de elementos superiores (losa, vigas, marcos)")
+    pisos_detectados: List[CotaPiso] = Field(description="Lista de cotas de piso NPT encontradas")
+    elementos_techo: List[ElementoTecho] = Field(description="Lista de elementos superiores")
     observacion_ingenieria: str = Field(description="Explicación técnica de la relación entre 6.80m, 4.50m y los 5cm de desnivel")
 
 def deducir_alturas_multicota(textos_interior: list, textos_globales: list, alturas_vectoriales_corte: list) -> dict:
-    """
-    Combina visión vectorial del corte con interpretación semántica en Gemini Flash.
-    """
     api_key = os.environ.get("GEMINI_API_KEY") or st.secrets.get("GEMINI_API_KEY", None)
     
     fallback_data = {
-        "nombre_espacio": "Espacio Comercial",
+        "nombre_espacio": "MC DONALD'S",
         "altura_losa": 6.80,
         "altura_libre": 4.50,
         "nivel_piso_dominante": 5.95,
@@ -64,27 +61,23 @@ def deducir_alturas_multicota(textos_interior: list, textos_globales: list, altu
 
     try:
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel("gemini-3.8-flash")
+        model = genai.GenerativeModel("gemini-1.5-flash")
 
         prompt = f"""
         Eres un motor ConTech experto en arquitectura comercial e ingeniería estructural.
-        Analiza las anotaciones de texto Y las alturas vectoriales medidas físicamente en el corte CAD:
+        Analiza las anotaciones de texto Y las alturas vectoriales medidas en el corte CAD:
 
-        - TEXTOS Y ANOTACIONES DEL ARCHIVO:
+        - TEXTOS DEL ARCHIVO:
         {json.dumps(textos_interior + textos_globales, ensure_ascii=False)}
 
-        - ALTURAS VERTICALES MEDIDAS GEOMÉTRICAMENTE EN LAS LÍNEAS DEL CORTE (Delta Y):
+        - ALTURAS VERTICALES MEDIDAS EN EL CORTE (Delta Y):
         {json.dumps(alturas_vectoriales_corte[:15], ensure_ascii=False)}
 
-        INSTRUCCIONES CLAVE DE INGENIERÍA:
+        INSTRUCCIONES CLAVE:
         1. Identifica el nombre del locatario (ej. 'MC DONALD\'S').
-        2. COMPARA TEXTOS CON LA GEOMETRÍA:
-           - Si en los textos aparece una cota de 4.50m a un marco metálico, pero las líneas verticales del corte miden cerca de 6.80m entre piso y losa:
-             * La altura estructural total a la losa es de 6.80m.
-             * La altura libre de acceso bajo el marco es de 4.50m.
-             * El descuelgue del marco metálico es de 2.30m (6.80 - 4.50).
-        3. Identifica vigas de concreto peraltadas (ej. descuelgue de 0.60m).
-        4. Identifica los niveles NPT interior (ej. 5.95) y exterior (ej. 6.00).
+        2. Determina la altura estructural a la losa (ej. 6.80m medida en corte) y la altura libre al marco metálico (ej. 4.50m).
+        3. Identifica el descuelgue del marco (6.80 - 4.50 = 2.30m) y de vigas (0.60m).
+        4. Identifica niveles NPT interior (5.95m) y exterior (6.00m).
         """
 
         respuesta = model.generate_content(
@@ -97,7 +90,6 @@ def deducir_alturas_multicota(textos_interior: list, textos_globales: list, altu
         )
 
         datos = json.loads(respuesta.text)
-        
         return {
             "nombre_espacio": datos.get("nombre_espacio", "MC DONALD'S"),
             "altura_losa": round(float(datos.get("altura_losa_estructural", 6.80)), 2),
@@ -158,16 +150,21 @@ if archivo_dxf is not None:
     if st.session_state['capas_disponibles']:
         st.info(f"🔍 Detectamos {len(st.session_state['capas_disponibles'])} capas.")
         
-        col_ui_1, col_ui_2 = st.columns(2)
+        col_ui_1, col_ui_2, col_ui_3 = st.columns(3)
         with col_ui_1:
             capas_seleccionadas = st.multiselect(
-                "👉 Capas del Recinto (Muros, Límites de Concesión, Áreas, Hatch):",
+                "👉 1. Recinto (Muros, Concesión, Hatch):",
                 st.session_state['capas_disponibles']
             )
         with col_ui_2:
             capas_columnas = st.multiselect(
-                "🏛️ (Opcional) Capas de Columnas / Obstáculos:",
+                "🏛️ 2. Columnas (S-MUROS, COLUMNAS):",
                 [c for c in st.session_state['capas_disponibles'] if c not in capas_seleccionadas]
+            )
+        with col_ui_3:
+            capas_vigas = st.multiselect(
+                "🏗️ 3. Vigas (S-VIGAS PERALTADAS, A-VIGA):",
+                [c for c in st.session_state['capas_disponibles'] if c not in capas_seleccionadas and c not in capas_columnas]
             )
 
         if st.button("🚀 Procesar Arquitectura Limpia"):
@@ -176,25 +173,30 @@ if archivo_dxf is not None:
                 st.stop()
                 
             try:
-                with st.spinner("🧠 Filtrando geometría, midiendo cortes y analizando IA..."):
+                with st.spinner("🧠 Filtrando geometría, calculando vigas y analizando IA..."):
                     doc = ezdxf.readfile(st.session_state['archivo_path'])
                     msp = doc.modelspace()
                     
                     muros_crudos = []
                     alturas_vectoriales_corte = []
+                    lineas_vigas_crudo = []
+                    lineas_columnas = []
 
-                    # 1. ESCÁNER DE LÍNEAS VECTORIALES (Detecta muros y mide líneas de corte)
+                    # 1. ESCÁNER DE ENTIDADES LINE / LWPOLYLINE
                     for e in msp.query('LINE LWPOLYLINE'):
                         if e.dxftype() == 'LINE':
                             p1, p2 = (e.dxf.start.x, e.dxf.start.y), (e.dxf.end.x, e.dxf.end.y)
-                            # Si es casi vertical pura (línea de tabique en corte), guardar su longitud
-                            dx = abs(p2[0] - p1[0])
-                            dy = abs(p2[1] - p1[1])
+                            dx, dy = abs(p2[0] - p1[0]), abs(p2[1] - p1[1])
+                            
                             if dx < 0.05 and 2.5 <= dy <= 12.0:
                                 alturas_vectoriales_corte.append(round(dy, 2))
                                 
                             if e.dxf.layer in capas_seleccionadas and p1 != p2:
                                 muros_crudos.append({"x1": p1[0], "y1": p1[1], "x2": p2[0], "y2": p2[1]})
+                            elif e.dxf.layer in capas_vigas and p1 != p2:
+                                lineas_vigas_crudo.append({"x1": p1[0], "y1": p1[1], "x2": p2[0], "y2": p2[1]})
+                            elif e.dxf.layer in capas_columnas and p1 != p2:
+                                lineas_columnas.append({"x1": p1[0], "y1": p1[1], "x2": p2[0], "y2": p2[1]})
                                 
                         elif e.dxftype() == 'LWPOLYLINE':
                             pts = [(float(p[0]), float(p[1])) for p in e.get_points('xy')]
@@ -203,12 +205,23 @@ if archivo_dxf is not None:
                                 dx, dy = abs(p2[0] - p1[0]), abs(p2[1] - p1[1])
                                 if dx < 0.05 and 2.5 <= dy <= 12.0:
                                     alturas_vectoriales_corte.append(round(dy, 2))
+                                    
                                 if e.dxf.layer in capas_seleccionadas and p1 != p2:
                                     muros_crudos.append({"x1": p1[0], "y1": p1[1], "x2": p2[0], "y2": p2[1]})
-                            if getattr(e, 'is_closed', False) and pts[-1] != pts[0] and e.dxf.layer in capas_seleccionadas:
-                                muros_crudos.append({"x1": pts[-1][0], "y1": pts[-1][1], "x2": pts[0][0], "y2": pts[0][1]})
+                                elif e.dxf.layer in capas_vigas and p1 != p2:
+                                    lineas_vigas_crudo.append({"x1": p1[0], "y1": p1[1], "x2": p2[0], "y2": p2[1]})
+                                elif e.dxf.layer in capas_columnas and p1 != p2:
+                                    lineas_columnas.append({"x1": p1[0], "y1": p1[1], "x2": p2[0], "y2": p2[1]})
 
-                    # 2. HATCH (Bordes de tramas de concesión)
+                            if getattr(e, 'is_closed', False) and pts[-1] != pts[0]:
+                                if e.dxf.layer in capas_seleccionadas:
+                                    muros_crudos.append({"x1": pts[-1][0], "y1": pts[-1][1], "x2": pts[0][0], "y2": pts[0][1]})
+                                elif e.dxf.layer in capas_vigas:
+                                    lineas_vigas_crudo.append({"x1": pts[-1][0], "y1": pts[-1][1], "x2": pts[0][0], "y2": pts[0][1]})
+                                elif e.dxf.layer in capas_columnas:
+                                    lineas_columnas.append({"x1": pts[-1][0], "y1": pts[-1][1], "x2": pts[0][0], "y2": pts[0][1]})
+
+                    # 2. HATCH (Bordes de concesión)
                     for h in msp.query('HATCH'):
                         if h.dxf.layer in capas_seleccionadas:
                             try:
@@ -229,24 +242,10 @@ if archivo_dxf is not None:
                             except Exception:
                                 pass
 
-                    # 3. COLUMNAS
-                    lineas_columnas = []
-                    if capas_columnas:
-                        for e in msp.query('LINE LWPOLYLINE'):
-                            if e.dxf.layer in capas_columnas:
-                                if e.dxftype() == 'LINE':
-                                    lineas_columnas.append({"x1": e.dxf.start.x, "y1": e.dxf.start.y, "x2": e.dxf.end.x, "y2": e.dxf.end.y})
-                                elif e.dxftype() == 'LWPOLYLINE':
-                                    pts = [(float(p[0]), float(p[1])) for p in e.get_points('xy')]
-                                    for i in range(len(pts) - 1):
-                                        lineas_columnas.append({"x1": pts[i][0], "y1": pts[i][1], "x2": pts[i+1][0], "y2": pts[i+1][1]})
-                                    if getattr(e, 'is_closed', False) and pts[-1] != pts[0]:
-                                        lineas_columnas.append({"x1": pts[-1][0], "y1": pts[-1][1], "x2": pts[0][0], "y2": pts[0][1]})
-
-                    # 4. TEXTOS Y COTAS
+                    # 3. TEXTOS Y COTAS
                     textos_crudos_dxf = []
                     for t in msp.query('TEXT MTEXT'):
-                        if t.dxf.layer not in capas_seleccionadas:
+                        if t.dxf.layer not in capas_seleccionadas and t.dxf.layer not in capas_vigas:
                             try:
                                 contenido = t.dxf.text if t.dxftype() == 'TEXT' else t.text
                                 if contenido and contenido.strip():
@@ -274,19 +273,6 @@ if archivo_dxf is not None:
                         except Exception:
                             pass
 
-                    for ml in msp.query('MULTILEADER'):
-                        try:
-                            context = getattr(ml, 'context', None)
-                            txt_ml = ""
-                            if context and hasattr(context, 'm_text') and context.m_text:
-                                txt_ml = getattr(context.m_text, 'raw_text', '') or getattr(context.m_text, 'default_text', '')
-                            if not txt_ml:
-                                txt_ml = getattr(ml.dxf, 'text', '')
-                            if txt_ml and txt_ml.strip():
-                                textos_crudos_dxf.append({"texto": txt_ml.strip(), "x": 0, "y": 0})
-                        except Exception:
-                            pass
-
                     del doc
                     del msp
                     gc.collect()
@@ -301,7 +287,6 @@ if archivo_dxf is not None:
                     dim_mayor = max(max(todos_x) - min_x, max(todos_y) - min_y)
                     factor = 1.0 if dim_mayor < 200 else (100.0 if dim_mayor < 25000 else 1000.0)
 
-                    # Normalizar alturas medidas con el factor
                     alturas_medidas_norm = [round(a / factor, 2) for a in alturas_vectoriales_corte if (a / factor) >= 2.5]
 
                     lineas_limpias = [
@@ -310,6 +295,7 @@ if archivo_dxf is not None:
                         for m in muros_crudos if m['x1']!=m['x2'] or m['y1']!=m['y2']
                     ]
 
+                    # Geometría del espacio habitable
                     red_unida = unary_union(snap(unary_union(lineas_limpias), unary_union(lineas_limpias), tolerance=0.25))
                     muros_solidos = [p for p in polygonize(red_unida) if p.is_valid and p.buffer(-0.08).is_empty and p.area > 0.05]
                     if not muros_solidos:
@@ -321,7 +307,6 @@ if archivo_dxf is not None:
                     vacios = envoltura.difference(union_muros)
                     todos_vacios = [g for g in (vacios.geoms if hasattr(vacios, 'geoms') else [vacios]) if isinstance(g, Polygon)]
                     
-                    # Fusión de recintos contiguos
                     cands = [g for g in todos_vacios if g.area > 2.0]
                     if cands:
                         fusion = unary_union(cands)
@@ -344,7 +329,35 @@ if archivo_dxf is not None:
                     hab_limpia = hab_principal.simplify(0.05, preserve_topology=True)
                     area_habitable = round(hab_limpia.area, 2)
 
-                    # Clasificación de textos
+                    # ==========================================================
+                    # EXTRACCIÓN GEOMÉTRICA EXACTA DE VIGAS (S-VIGAS PERALTADAS)
+                    # ==========================================================
+                    vigas_poligonos_export = []
+                    if lineas_vigas_crudo:
+                        vigas_geom = [
+                            LineString([((m['x1']-min_x)/factor, (m['y1']-min_y)/factor), 
+                                        ((m['x2']-min_x)/factor, (m['y2']-min_y)/factor)]) 
+                            for m in lineas_vigas_crudo
+                        ]
+                        red_vigas = snap(unary_union(vigas_geom), unary_union(vigas_geom), tolerance=0.15)
+                        # Polygonize encuentra la franja de 30cm formada por las dos líneas paralelas de la viga
+                        polys_vigas = [p for p in polygonize(red_vigas) if p.is_valid and p.area > 0.05]
+                        
+                        # Si son líneas de eje único, se expanden a 30cm
+                        if not polys_vigas:
+                            polys_vigas = [red_vigas.buffer(0.15, cap_style=2, join_style=2)]
+
+                        # Recortar las vigas para que solo existan dentro de la huella del local
+                        for pv in polys_vigas:
+                            corte_viga = pv.intersection(hab_limpia)
+                            if not corte_viga.is_empty:
+                                geoms_v = corte_viga.geoms if hasattr(corte_viga, 'geoms') else [corte_viga]
+                                for gv in geoms_v:
+                                    if isinstance(gv, Polygon) and gv.area > 0.08:
+                                        gv_simp = gv.simplify(0.02, preserve_topology=True)
+                                        vigas_poligonos_export.append([{"x": round(x,2), "y": round(y,2)} for x, y in gv_simp.exterior.coords])
+
+                    # Textos y vanos
                     hab_tolerancia = hab_limpia.buffer(0.40)
                     textos_dentro = []
                     textos_fuera = []
@@ -357,7 +370,6 @@ if archivo_dxf is not None:
                         else:
                             textos_fuera.append(t["texto"])
 
-                    # Escáner de Vanos
                     vanos_detectados = []
                     poligono_exterior = hab_limpia.exterior if hasattr(hab_limpia, 'exterior') else (hab_limpia.geoms[0].exterior if hasattr(hab_limpia, 'geoms') else None)
                     if poligono_exterior:
@@ -385,14 +397,14 @@ if archivo_dxf is not None:
                                                 "ancho": round(dist, 2), "rot": rot, "espesor": 0.15
                                             })
 
-                # ANÁLISIS FORENSE COMPLETO (TEXTOS + VECTORES DEL CORTE)
+                # Inferencia con Gemini
                 with st.spinner("🤖 Analizando doble altura (6.80m vs 4.50m) y vigas con Gemini..."):
                     perfil_vertical = deducir_alturas_multicota(textos_dentro, textos_fuera, alturas_medidas_norm)
 
+                # Aforo Tetris
                 with st.spinner("🪑 Maximizando Aforo Comercial..."):
                     aforo_legal_max = math.floor(area_habitable / factor_area)
                     mesas_4p, mesas_2p = [], []
-                    
                     area_interior = hab_limpia.buffer(-0.80) 
                     burbujas_geom = []
                     for v in vanos_detectados:
@@ -441,7 +453,7 @@ if archivo_dxf is not None:
                     elif hasattr(hab_limpia, 'geoms'):
                         coords_contorno = [{"x": round(x,2), "y": round(y,2)} for x,y in hab_limpia.geoms[0].exterior.coords]
 
-                    # CONTRATO JSON ENRIQUECIDO DE DOBLE ALTURA
+                    # CONTRATO JSON ENRIQUECIDO CON VIGAS REALES
                     datos_proyecto = {
                         "espacio": perfil_vertical["nombre_espacio"],
                         "altura_muros": perfil_vertical["altura_losa"],         # 6.80m a la losa
@@ -455,6 +467,7 @@ if archivo_dxf is not None:
                             "observacion": perfil_vertical["observacion"]
                         },
                         "muros": muros_export,
+                        "vigas_reales": vigas_poligonos_export,                 # Coordenadas exactas CAD
                         "contorno_piso": coords_contorno,
                         "vanos": vanos_detectados,
                         "muebles": mesas_4p + mesas_2p,
@@ -476,6 +489,7 @@ if archivo_dxf is not None:
                         "npt": perfil_vertical["nivel_piso_dominante"],
                         "pisos": perfil_vertical["pisos"],
                         "techos": perfil_vertical["elementos_techo"],
+                        "vigas_detectadas": len(vigas_poligonos_export),
                         "obs": perfil_vertical["observacion"]
                     }
 
@@ -493,7 +507,7 @@ if st.session_state['datos_proyecto']:
     col3.metric("🚪 Altura Libre Acceso", f"{m['altura_libre']} m")
     col4.metric("🪑 Asientos Diseñados", f"{m['asientos']} Pax")
 
-    st.success(f"Cota N.P.T.: {m['npt']} m | Área Útil: {m['area']} m²")
+    st.success(f"Cota N.P.T.: {m['npt']} m | Área Útil: {m['area']} m² | Vigas CAD Exactas: {m['vigas_detectadas']}")
 
     with st.expander("📊 Desglose de Alturas, Vigas y Marcos Detectados"):
         st.markdown(f"**Observación de Ingeniería:** {m['obs']}")

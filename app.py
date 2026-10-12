@@ -16,30 +16,25 @@ st.title("🏗️ Patty - Generador Arquitectónico Paramétrico")
 st.markdown("---")
 
 # ==============================================================================
-# 1. CONTRATO DE DATOS Y ESQUEMA ESTRUCTURADO PARA GEMINI FLASH
+# 1. ESQUEMA PURE-SCHEMA PARA GEMINI (SIN 'default', 100% COMPATIBLE CON PROTOBUF)
 # ==============================================================================
 class RecintoInfo(BaseModel):
-    nombre_recinto: Optional[str] = Field(
-        default="Espacio Comercial", 
+    nombre_recinto: str = Field(
         description="Nombre del espacio o locatario detectado (ej. MC DONALD'S, LOCAL COMERCIAL, RESTAURANTE, SALA)"
     )
-    altura_muro: Optional[float] = Field(
-        default=None, 
-        description="Altura libre detectada en metros o cota vertical entre piso y losa/viga (ej. 4.50, 2.80)"
+    altura_muro: float = Field(
+        description="Altura libre vertical detectada en metros entre piso y losa/viga (ej. 4.50, 2.80)"
     )
-    nivel_piso: Optional[float] = Field(
-        default=0.0, 
-        description="Cota de nivel de piso terminado (NPT) en metros (ej. 5.95, 6.00, 0.00)"
+    nivel_piso: float = Field(
+        description="Cota de nivel de piso terminado NPT en metros (ej. 5.95, 6.00, 0.00)"
     )
 
 class InferenciaCotas(BaseModel):
     recinto: RecintoInfo
-    altura_general: Optional[float] = Field(
-        default=None, 
-        description="Altura global o estándar detectada en notas o cotas"
+    altura_general: float = Field(
+        description="Altura global o cota estándar detectada en metros"
     )
-    observacion: Optional[str] = Field(
-        default="", 
+    observacion: str = Field(
         description="Detalle de las cotas encontradas en el plano o corte"
     )
 
@@ -58,7 +53,7 @@ def deducir_alturas_con_gemini(textos_interior: list, textos_globales: list) -> 
 
     try:
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel("gemini-3.8-flash")
+        model = genai.GenerativeModel("gemini-1.5-flash")
 
         prompt = f"""
         Eres un motor ConTech experto en análisis arquitectónico, planos y cortes de construcción.
@@ -71,10 +66,10 @@ def deducir_alturas_con_gemini(textos_interior: list, textos_globales: list) -> 
         {json.dumps(textos_globales, ensure_ascii=False)}
 
         INSTRUCCIONES CLAVE:
-        1. Identifica el nombre del recinto o marca/locatario (ej. 'MC DONALD\'S', 'LOCAL COMERCIAL', 'TABIQUE LOCATARIO').
-        2. Deduce la altura libre vertical entre piso y losa/viga (ej. cotas dimensionales como '4.50', '4.5', 'COTA 4.50', H=4.50). Conviértela a número flotante en metros.
-        3. Identifica niveles de piso terminado (ej. 'NPT +5.95', 'NPT +6.00'). Si hay varios, toma el nivel interior o dominante.
-        4. Si encuentras cotas dimensionales numéricas puras como 'COTA 4.5' o '4.50', evalúa si corresponden a la altura del espacio.
+        1. Identifica el nombre del recinto o marca/locatario (ej. 'MC DONALD\'S', 'LOCAL COMERCIAL'). Si no hay, pon 'Espacio Comercial'.
+        2. Deduce la altura libre vertical entre piso y losa/viga (ej. cotas dimensionales como '4.50', '4.5', 'COTA 4.50', H=4.50). Conviértela a float en metros. Si no hay, devuelve 2.80.
+        3. Identifica niveles de piso terminado (ej. 'NPT +5.95', 'NPT +6.00'). Si no hay cota NPT, devuelve 0.00.
+        4. Si encuentras cotas numéricas puras como 'COTA 4.5' o '4.50', evalúa si corresponden a la altura del espacio.
         """
 
         respuesta = model.generate_content(
@@ -88,10 +83,10 @@ def deducir_alturas_con_gemini(textos_interior: list, textos_globales: list) -> 
 
         datos = json.loads(respuesta.text)
         recinto = datos.get("recinto", {})
-        altura_general = datos.get("altura_general")
+        altura_general = datos.get("altura_general", 2.80)
 
         altura_final = recinto.get("altura_muro") or altura_general or 2.80
-        nivel_piso_final = recinto.get("nivel_piso") if recinto.get("nivel_piso") is not None else 0.00
+        nivel_piso_final = recinto.get("nivel_piso", 0.00)
         nombre_final = recinto.get("nombre_recinto") or "Espacio Comercial"
 
         return round(float(altura_final), 2), round(float(nivel_piso_final), 2), nombre_final
@@ -173,10 +168,10 @@ if archivo_dxf is not None:
                                 for i in range(len(pts) - 1):
                                     if pts[i] != pts[i+1]: muros_crudos.append({"x1": pts[i][0], "y1": pts[i][1], "x2": pts[i+1][0], "y2": pts[i+1][1]})
                                 if getattr(e, 'is_closed', False) and pts[-1] != pts[0]:
-                                    muros_crudos.append({"x1": pts[-1][0], "y1": pts[-1][1], "x2": pts[0][0], "y2": pts[0][1]})
+                                    muros_crudos.append({"x1": pts[-1][0], "y1": pts[-1][0], "x2": pts[0][0], "y2": pts[0][1]})
 
                     # ==========================================================
-                    # EXTRACCIÓN AVANZADA: TEXT, MTEXT, DIMENSION Y MULTILEADER
+                    # EXTRACCIÓN: TEXT, MTEXT, DIMENSION Y MULTILEADER
                     # ==========================================================
                     textos_crudos_dxf = []
 

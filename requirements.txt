@@ -1,3 +1,5 @@
 streamlit
 ezdxf
 shapely
+pydantic
+google-generativeai

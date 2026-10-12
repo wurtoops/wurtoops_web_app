@@ -5,6 +5,7 @@ import tempfile
 import os
 import math
 import gc
+import re
 from typing import Optional, List
 from pydantic import BaseModel, Field
 import google.generativeai as genai
@@ -16,8 +17,14 @@ st.title("🏗️ Patty - Generador Arquitectónico Paramétrico")
 st.markdown("---")
 
 # ==============================================================================
-# 1. ESQUEMA MULTICOTA Y PERFIL ESTRUCTURAL COMPLETO
+# 1. ESQUEMAS ESTRUCTURADOS (GEMINI FLASH - PROTOBUF SAFE)
 # ==============================================================================
+class ClasificacionCapas(BaseModel):
+    capas_recinto: List[str] = Field(description="Capas de muros, tabiques, límites de concesión, áreas de local o tramas de piso (ej. A-WALL, A-TABI, RC-Hatch, LINEA-CONCEC)")
+    capas_columnas: List[str] = Field(description="Capas de columnas estructurales o pilares (ej. S-COLS, S_COLUMNA METALICA, S-MUROS)")
+    capas_vigas: List[str] = Field(description="Capas de vigas estructurales o de techo (ej. S-VIGAS PERALTADAS, A-VIGA, BEAMS)")
+    razon_analisis: str = Field(description="Breve justificación técnica de la selección de capas")
+
 class CotaPiso(BaseModel):
     etiqueta: str = Field(description="Nombre o etiqueta del nivel (ej. 'NPT Interior', 'NPT Pasillo Mall')")
     cota_metros: float = Field(description="Valor numérico de la cota en metros (ej. 5.95, 6.00, 0.00)")
@@ -38,6 +45,79 @@ class InferenciaMulticota(BaseModel):
     elementos_techo: List[ElementoTecho] = Field(description="Lista de elementos superiores")
     observacion_ingenieria: str = Field(description="Explicación técnica de la relación entre 6.80m, 4.50m y los 5cm de desnivel")
 
+# ==============================================================================
+# 2. FUNCIONES DE INTELIGENCIA SEMÁNTICA
+# ==============================================================================
+def auto_clasificar_capas(todas_las_capas: list) -> dict:
+    """
+    Clasifica automáticamente hasta 150 capas usando Gemini Flash.
+    Incluye fallback heurístico de ingeniería si no hay conexión API.
+    """
+    api_key = os.environ.get("GEMINI_API_KEY") or st.secrets.get("GEMINI_API_KEY", None)
+
+    # Heurística de respaldo (AIA Layer Guidelines)
+    def fallback_heuristico():
+        recinto, cols, vigas = [], [], []
+        pat_recinto = re.compile(r'(muro|wall|tabi|concec|conces|local|area|hatch|piso|envol)', re.IGNORECASE)
+        pat_cols = re.compile(r'(col|pilar|columna)', re.IGNORECASE)
+        pat_vigas = re.compile(r'(viga|beam|vp)', re.IGNORECASE)
+        pat_basura = re.compile(r'^(e-|m-|san|aci|elec|cota|dim|text|eje|grid|0$|defpoints)', re.IGNORECASE)
+
+        for c in todas_las_capas:
+            if pat_basura.search(c):
+                continue
+            if pat_cols.search(c):
+                cols.append(c)
+            elif pat_vigas.search(c):
+                vigas.append(c)
+            elif pat_recinto.search(c):
+                recinto.append(c)
+        return {
+            "recinto": recinto,
+            "columnas": cols,
+            "vigas": vigas,
+            "razon": "Clasificación automática por reglas AIA"
+        }
+
+    if not api_key:
+        return fallback_heuristico()
+
+    try:
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel("gemini-1.5-flash")
+
+        prompt = f"""
+        Eres un ingeniero ConTech experto en planos CAD de retail y centros comerciales.
+        Analiza esta lista de capas extraídas de un archivo DXF:
+        {json.dumps(todas_las_capas, ensure_ascii=False)}
+
+        INSTRUCCIONES CLAVE:
+        1. CLASIFICA LAS CAPAS EN 3 CATEGORÍAS ESTRICTAS:
+           - capas_recinto: Muros perimetrales, tabiques de drywall, límites de concesión, polígonos de área de local, tramas/hatch de piso.
+           - capas_columnas: Columnas de concreto, columnas metálicas o pilares estructurales.
+           - capas_vigas: Vigas de techo, vigas peraltadas (VP), vigas descolgadas.
+        2. DESCARTA COMPLETAMENTE capas eléctricas (E-), mecánicas/clima (M-), sanitarias (SAN, ACI), textos (TEXT), ejes de replanteo (EJES, GRID) y cotas (COTAS, DIM).
+        3. Solo devuelve nombres exactos que existan en la lista.
+        """
+
+        res = model.generate_content(
+            prompt,
+            generation_config=genai.GenerationConfig(
+                response_mime_type="application/json",
+                response_schema=ClasificacionCapas,
+                temperature=0.0
+            )
+        )
+        datos = json.loads(res.text)
+        return {
+            "recinto": [c for c in datos.get("capas_recinto", []) if c in todas_las_capas],
+            "columnas": [c for c in datos.get("capas_columnas", []) if c in todas_las_capas],
+            "vigas": [c for c in datos.get("capas_vigas", []) if c in todas_las_capas],
+            "razon": datos.get("razon_analisis", "Análisis IA exitoso")
+        }
+    except Exception:
+        return fallback_heuristico()
+
 def deducir_alturas_multicota(textos_interior: list, textos_globales: list, alturas_vectoriales_corte: list) -> dict:
     api_key = os.environ.get("GEMINI_API_KEY") or st.secrets.get("GEMINI_API_KEY", None)
     
@@ -52,16 +132,15 @@ def deducir_alturas_multicota(textos_interior: list, textos_globales: list, altu
             {"tipo": "VIGA_DESCOLGADA", "descripcion": "Viga Concreto S/C", "cota_inferior_metros": 6.20, "descuelgue_metros": 0.60},
             {"tipo": "LOSA_TECHO", "descripcion": "Losa Colaborante", "cota_inferior_metros": 6.80, "descuelgue_metros": 0.0}
         ],
-        "observacion": "Doble altura de 6.80m con marco de acceso a 4.50m y viga descolgada de 0.60m"
+        "observacion": "Doble altura con marco a 4.50m y losa a 6.80m"
     }
 
     if not api_key:
-        st.warning("⚠️ No se encontró GEMINI_API_KEY en Streamlit Secrets.")
         return fallback_data
 
     try:
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel("gemini-3.8-flash")
+        model = genai.GenerativeModel("gemini-1.5-flash")
 
         prompt = f"""
         Eres un motor ConTech experto en arquitectura comercial e ingeniería estructural.
@@ -88,7 +167,6 @@ def deducir_alturas_multicota(textos_interior: list, textos_globales: list, altu
                 temperature=0.0
             )
         )
-
         datos = json.loads(respuesta.text)
         return {
             "nombre_espacio": datos.get("nombre_espacio", "MC DONALD'S"),
@@ -99,19 +177,20 @@ def deducir_alturas_multicota(textos_interior: list, textos_globales: list, altu
             "elementos_techo": datos.get("elementos_techo", fallback_data["elementos_techo"]),
             "observacion": datos.get("observacion_ingenieria", fallback_data["observacion"])
         }
-
     except Exception as e:
         st.error(f"❌ Error al consultar Gemini Multicota: {e}")
         return fallback_data
 
 # ==============================================================================
-# 2. MEMORIA RAM EFÍMERA EN STREAMLIT
+# 3. GESTIÓN DE ESTADO Y SUBIDA DE ARCHIVO
 # ==============================================================================
 if 'datos_proyecto' not in st.session_state:
     st.session_state['datos_proyecto'] = None
     st.session_state['metrics'] = None
 if 'capas_disponibles' not in st.session_state:
     st.session_state['capas_disponibles'] = []
+if 'sugerencias_capas' not in st.session_state:
+    st.session_state['sugerencias_capas'] = {"recinto": [], "columnas": [], "vigas": [], "razon": ""}
 if 'archivo_path' not in st.session_state:
     st.session_state['archivo_path'] = None
 if 'nombre_archivo' not in st.session_state:
@@ -123,23 +202,29 @@ pasillo_min = 1.20
 archivo_dxf = st.file_uploader("📥 Arrastra aquí el plano CAD (.DXF)", type=['dxf'])
 
 if archivo_dxf is not None:
+    # 1. LECTURA Y AUTO-CLASIFICACIÓN INTELIGENTE DE CAPAS
     if st.session_state['nombre_archivo'] != archivo_dxf.name:
         st.session_state['nombre_archivo'] = archivo_dxf.name
         st.session_state['datos_proyecto'] = None 
         st.session_state['capas_disponibles'] = []
+        st.session_state['sugerencias_capas'] = {"recinto": [], "columnas": [], "vigas": [], "razon": ""}
         
         with tempfile.NamedTemporaryFile(delete=False, suffix=".dxf") as tmp_file:
             tmp_file.write(archivo_dxf.read()) 
             st.session_state['archivo_path'] = tmp_file.name
             
-        with st.spinner("⏳ Analizando estructura del archivo pesado..."):
+        with st.spinner("⏳ Analizando capas y auto-clasificando con IA..."):
             try:
                 doc = ezdxf.readfile(st.session_state['archivo_path'])
                 msp = doc.modelspace()
                 capas = set()
                 for e in msp.query('LINE LWPOLYLINE HATCH'):
                     capas.add(e.dxf.layer)
-                st.session_state['capas_disponibles'] = sorted(list(capas))
+                lista_ordenada = sorted(list(capas))
+                st.session_state['capas_disponibles'] = lista_ordenada
+                
+                # Clasificación automática inmediata
+                st.session_state['sugerencias_capas'] = auto_clasificar_capas(lista_ordenada)
                 
                 del doc
                 del msp
@@ -147,24 +232,31 @@ if archivo_dxf is not None:
             except Exception as e:
                 st.error(f"Error al leer el archivo: {e}")
 
+    # 2. UI CON PRE-SELECCIÓN AUTOMÁTICA
     if st.session_state['capas_disponibles']:
-        st.info(f"🔍 Detectamos {len(st.session_state['capas_disponibles'])} capas.")
+        sug = st.session_state['sugerencias_capas']
+        st.success(f"🤖 **Auto-Selector Activo:** De {len(st.session_state['capas_disponibles'])} capas detectadas, Patty pre-seleccionó las opciones recomendadas ({sug.get('razon', '')}).")
         
         col_ui_1, col_ui_2, col_ui_3 = st.columns(3)
         with col_ui_1:
             capas_seleccionadas = st.multiselect(
                 "👉 1. Recinto (Muros, Concesión, Hatch):",
-                st.session_state['capas_disponibles']
+                st.session_state['capas_disponibles'],
+                default=[c for c in sug.get("recinto", []) if c in st.session_state['capas_disponibles']]
             )
         with col_ui_2:
+            disp_cols = [c for c in st.session_state['capas_disponibles'] if c not in capas_seleccionadas]
             capas_columnas = st.multiselect(
                 "🏛️ 2. Columnas (S-MUROS, COLUMNAS):",
-                [c for c in st.session_state['capas_disponibles'] if c not in capas_seleccionadas]
+                disp_cols,
+                default=[c for c in sug.get("columnas", []) if c in disp_cols]
             )
         with col_ui_3:
+            disp_vigas = [c for c in st.session_state['capas_disponibles'] if c not in capas_seleccionadas and c not in capas_columnas]
             capas_vigas = st.multiselect(
                 "🏗️ 3. Vigas (S-VIGAS PERALTADAS, A-VIGA):",
-                [c for c in st.session_state['capas_disponibles'] if c not in capas_seleccionadas and c not in capas_columnas]
+                disp_vigas,
+                default=[c for c in sug.get("vigas", []) if c in disp_vigas]
             )
 
         if st.button("🚀 Procesar Arquitectura Limpia"):
@@ -273,6 +365,19 @@ if archivo_dxf is not None:
                         except Exception:
                             pass
 
+                    for ml in msp.query('MULTILEADER'):
+                        try:
+                            context = getattr(ml, 'context', None)
+                            txt_ml = ""
+                            if context and hasattr(context, 'm_text') and context.m_text:
+                                txt_ml = getattr(context.m_text, 'raw_text', '') or getattr(context.m_text, 'default_text', '')
+                            if not txt_ml:
+                                txt_ml = getattr(ml.dxf, 'text', '')
+                            if txt_ml and txt_ml.strip():
+                                textos_crudos_dxf.append({"texto": txt_ml.strip(), "x": 0, "y": 0})
+                        except Exception:
+                            pass
+
                     del doc
                     del msp
                     gc.collect()
@@ -329,9 +434,7 @@ if archivo_dxf is not None:
                     hab_limpia = hab_principal.simplify(0.05, preserve_topology=True)
                     area_habitable = round(hab_limpia.area, 2)
 
-                    # ==========================================================
-                    # EXTRACCIÓN GEOMÉTRICA EXACTA DE VIGAS (S-VIGAS PERALTADAS)
-                    # ==========================================================
+                    # EXTRACCIÓN DE VIGAS EN COORDENADAS EXACTAS
                     vigas_poligonos_export = []
                     if lineas_vigas_crudo:
                         vigas_geom = [
@@ -340,14 +443,12 @@ if archivo_dxf is not None:
                             for m in lineas_vigas_crudo
                         ]
                         red_vigas = snap(unary_union(vigas_geom), unary_union(vigas_geom), tolerance=0.15)
-                        # Polygonize encuentra la franja de 30cm formada por las dos líneas paralelas de la viga
                         polys_vigas = [p for p in polygonize(red_vigas) if p.is_valid and p.area > 0.05]
                         
-                        # Si son líneas de eje único, se expanden a 30cm
                         if not polys_vigas:
-                            polys_vigas = [red_vigas.buffer(0.15, cap_style=2, join_style=2)]
+                            buf_vigas = red_vigas.buffer(0.15, cap_style=2, join_style=2)
+                            polys_vigas = list(buf_vigas.geoms) if isinstance(buf_vigas, MultiPolygon) else [buf_vigas]
 
-                        # Recortar las vigas para que solo existan dentro de la huella del local
                         for pv in polys_vigas:
                             corte_viga = pv.intersection(hab_limpia)
                             if not corte_viga.is_empty:
@@ -453,12 +554,12 @@ if archivo_dxf is not None:
                     elif hasattr(hab_limpia, 'geoms'):
                         coords_contorno = [{"x": round(x,2), "y": round(y,2)} for x,y in hab_limpia.geoms[0].exterior.coords]
 
-                    # CONTRATO JSON ENRIQUECIDO CON VIGAS REALES
+                    # CONTRATO JSON ENRIQUECIDO
                     datos_proyecto = {
                         "espacio": perfil_vertical["nombre_espacio"],
-                        "altura_muros": perfil_vertical["altura_losa"],         # 6.80m a la losa
-                        "altura_libre_acceso": perfil_vertical["altura_libre"],  # 4.50m al marco
-                        "nivel_piso": perfil_vertical["nivel_piso_dominante"],   # 5.95m
+                        "altura_muros": perfil_vertical["altura_losa"],
+                        "altura_libre_acceso": perfil_vertical["altura_libre"],
+                        "nivel_piso": perfil_vertical["nivel_piso_dominante"],
                         "perfil_vertical": {
                             "altura_losa": perfil_vertical["altura_losa"],
                             "altura_libre": perfil_vertical["altura_libre"],
@@ -467,7 +568,7 @@ if archivo_dxf is not None:
                             "observacion": perfil_vertical["observacion"]
                         },
                         "muros": muros_export,
-                        "vigas_reales": vigas_poligonos_export,                 # Coordenadas exactas CAD
+                        "vigas_reales": vigas_poligonos_export,
                         "contorno_piso": coords_contorno,
                         "vanos": vanos_detectados,
                         "muebles": mesas_4p + mesas_2p,
@@ -497,13 +598,13 @@ if archivo_dxf is not None:
                 st.error(f"❌ Error al procesar: {e}")
 
 # ==============================================================================
-# 3. INTERFAZ Y DASHBOARD
+# 4. DASHBOARD Y DESCARGA
 # ==============================================================================
 if st.session_state['datos_proyecto']:
     m = st.session_state['metrics']
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("🏷️ Espacio", f"{m['espacio']}")
-    col2.metric("📐 Altura a Losa (Real)", f"{m['altura_losa']} m")
+    col2.metric("📐 Altura Losa", f"{m['altura_losa']} m")
     col3.metric("🚪 Altura Libre Acceso", f"{m['altura_libre']} m")
     col4.metric("🪑 Asientos Diseñados", f"{m['asientos']} Pax")
 

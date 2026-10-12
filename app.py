@@ -16,7 +16,7 @@ st.title("🏗️ Patty - Generador Arquitectónico Paramétrico")
 st.markdown("---")
 
 # ==============================================================================
-# 1. ESQUEMA PURE-SCHEMA PARA GEMINI (SIN 'default', 100% COMPATIBLE CON PROTOBUF)
+# 1. ESQUEMA ESTRICTO GEMINI FLASH (100% PROTOBUF SAFE)
 # ==============================================================================
 class RecintoInfo(BaseModel):
     nombre_recinto: str = Field(
@@ -39,9 +39,6 @@ class InferenciaCotas(BaseModel):
     )
 
 def deducir_alturas_con_gemini(textos_interior: list, textos_globales: list) -> tuple:
-    """
-    Envía las anotaciones y cotas a Gemini Flash con validación JSON estricta.
-    """
     api_key = os.environ.get("GEMINI_API_KEY") or st.secrets.get("GEMINI_API_KEY", None)
     
     if not api_key:
@@ -53,7 +50,7 @@ def deducir_alturas_con_gemini(textos_interior: list, textos_globales: list) -> 
 
     try:
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel("gemini-3.8-flash")
+        model = genai.GenerativeModel("gemini-1.5-flash")
 
         prompt = f"""
         Eres un motor ConTech experto en análisis arquitectónico, planos y cortes de construcción.
@@ -114,7 +111,6 @@ pasillo_min = 1.20
 archivo_dxf = st.file_uploader("📥 Arrastra aquí el plano CAD (.DXF)", type=['dxf'])
 
 if archivo_dxf is not None:
-    # 1. LECTURA INICIAL DE CAPAS (Limpia RAM de inmediato)
     if st.session_state['nombre_archivo'] != archivo_dxf.name:
         st.session_state['nombre_archivo'] = archivo_dxf.name
         st.session_state['datos_proyecto'] = None 
@@ -139,7 +135,6 @@ if archivo_dxf is not None:
             except Exception as e:
                 st.error(f"Error al leer el archivo: {e}")
 
-    # 2. PROCESAMIENTO GEOMÉTRICO Y SEMÁNTICO
     if st.session_state['capas_disponibles']:
         st.info(f"🔍 Detectamos {len(st.session_state['capas_disponibles'])} capas.")
         capas_seleccionadas = st.multiselect(
@@ -168,14 +163,10 @@ if archivo_dxf is not None:
                                 for i in range(len(pts) - 1):
                                     if pts[i] != pts[i+1]: muros_crudos.append({"x1": pts[i][0], "y1": pts[i][1], "x2": pts[i+1][0], "y2": pts[i+1][1]})
                                 if getattr(e, 'is_closed', False) and pts[-1] != pts[0]:
-                                    muros_crudos.append({"x1": pts[-1][0], "y1": pts[-1][0], "x2": pts[0][0], "y2": pts[0][1]})
+                                    muros_crudos.append({"x1": pts[-1][0], "y1": pts[-1][1], "x2": pts[0][0], "y2": pts[0][1]})
 
-                    # ==========================================================
-                    # EXTRACCIÓN: TEXT, MTEXT, DIMENSION Y MULTILEADER
-                    # ==========================================================
+                    # EXTRACCIÓN DE TEXTOS, COTAS Y DIRECTRICES
                     textos_crudos_dxf = []
-
-                    # A. Textos planos (TEXT y MTEXT)
                     for t in msp.query('TEXT MTEXT'):
                         if t.dxf.layer not in capas_seleccionadas:
                             try:
@@ -189,7 +180,6 @@ if archivo_dxf is not None:
                             except Exception:
                                 pass
 
-                    # B. Cotas Dimensionales (DIMENSION) -> Captura cotas como "4.50"
                     for d in msp.query('DIMENSION'):
                         try:
                             txt_cota = getattr(d.dxf, 'text', '').strip()
@@ -199,7 +189,6 @@ if archivo_dxf is not None:
                                     txt_cota = f"COTA {med}"
                                 except Exception:
                                     pass
-                            
                             if txt_cota:
                                 def_pt = getattr(d.dxf, 'defpoint', None) or getattr(d.dxf, 'text_midpoint', None)
                                 if def_pt:
@@ -207,7 +196,6 @@ if archivo_dxf is not None:
                         except Exception:
                             pass
 
-                    # C. Directrices (MULTILEADER) -> Captura "NPT +5.95" y flechas
                     for ml in msp.query('MULTILEADER'):
                         try:
                             context = getattr(ml, 'context', None)
@@ -216,13 +204,11 @@ if archivo_dxf is not None:
                                 txt_ml = getattr(context.m_text, 'raw_text', '') or getattr(context.m_text, 'default_text', '')
                             if not txt_ml:
                                 txt_ml = getattr(ml.dxf, 'text', '')
-                            
                             if txt_ml and txt_ml.strip():
                                 textos_crudos_dxf.append({"texto": txt_ml.strip(), "x": 0, "y": 0})
                         except Exception:
                             pass
 
-                    # Liberación inmediata de RAM del CAD
                     del doc
                     del msp
                     gc.collect()
@@ -239,9 +225,10 @@ if archivo_dxf is not None:
 
                     lineas_limpias = [LineString([((m['x1']-min_x)/factor, (m['y1']-min_y)/factor), ((m['x2']-min_x)/factor, (m['y2']-min_y)/factor)]) for m in muros_crudos if m['x1']!=m['x2'] or m['y1']!=m['y2']]
 
-                    red_unida = unary_union(snap(unary_union(lineas_limpias), unary_union(lineas_limpias), tolerance=0.10))
+                    # TOLERANCIA DE SELLADO AUMENTADA A 0.25m PARA CERRAR ESQUINAS ABIERTAS
+                    red_unida = unary_union(snap(unary_union(lineas_limpias), unary_union(lineas_limpias), tolerance=0.25))
                     
-                    muros_solidos = [p for p in polygonize(red_unida) if p.is_valid and p.buffer(-0.10).is_empty and p.area > 0.05]
+                    muros_solidos = [p for p in polygonize(red_unida) if p.is_valid and p.buffer(-0.08).is_empty and p.area > 0.05]
                     if not muros_solidos:
                         muro_buffer = red_unida.buffer(0.10, cap_style=2, join_style=2)
                         muros_solidos = list(muro_buffer.geoms) if isinstance(muro_buffer, MultiPolygon) else [muro_buffer]
@@ -250,8 +237,11 @@ if archivo_dxf is not None:
                     envoltura = union_muros.convex_hull
                     vacios = envoltura.difference(union_muros)
                     
-                    cands = [g for g in (vacios.geoms if hasattr(vacios, 'geoms') else [vacios]) if isinstance(g, Polygon) and g.area > 2.0]
-                    hab_principal = max(cands, key=lambda h: h.area) if cands else envoltura
+                    todos_vacios = [g for g in (vacios.geoms if hasattr(vacios, 'geoms') else [vacios]) if isinstance(g, Polygon)]
+                    areas_detectadas = [round(g.area, 2) for g in todos_vacios]
+
+                    cands = [g for g in todos_vacios if g.area > 2.0]
+                    hab_principal = max(cands, key=lambda h: h.area) if cands else (max(todos_vacios, key=lambda h: h.area) if todos_vacios else envoltura)
                     
                     hab_limpia = hab_principal.simplify(0.05, preserve_topology=True)
                     area_habitable = round(hab_limpia.area, 2)
@@ -310,13 +300,11 @@ if archivo_dxf is not None:
                                             "ancho": round(dist, 2), "rot": rot, "espesor": espesor_real
                                         })
 
-                # INFERENCIA SEMÁNTICA CON GEMINI FLASH
                 with st.spinner("🤖 Leyendo cotas y deduciendo alturas con Gemini Flash..."):
                     altura_deducida, nivel_piso_deducido, nombre_espacio = deducir_alturas_con_gemini(
                         textos_dentro, textos_fuera
                     )
 
-                # OPTIMIZADOR DE AFORO (ALGORITMO TETRIS)
                 with st.spinner("🪑 Maximizando Aforo Comercial..."):
                     aforo_legal_max = math.floor(area_habitable / factor_area)
                     mesas_4p, mesas_2p = [], []
@@ -365,7 +353,6 @@ if archivo_dxf is not None:
                         p_simp = p.simplify(0.02, preserve_topology=True)
                         muros_export.append([{"x": round(x,2), "y": round(y,2)} for x,y in p_simp.exterior.coords])
 
-                    # CONTRATO JSON ENRIQUECIDO
                     datos_proyecto = {
                         "espacio": nombre_espacio,
                         "altura_muros": altura_deducida,
@@ -391,14 +378,20 @@ if archivo_dxf is not None:
                         "npt": nivel_piso_deducido,
                         "total_textos": len(textos_crudos_dxf),
                         "textos_dentro": textos_dentro,
-                        "textos_fuera": textos_fuera
+                        "textos_fuera": textos_fuera,
+                        "telemetria": {
+                            "num_muros": len(muros_crudos),
+                            "dim_mayor": round(dim_mayor, 2),
+                            "factor": factor,
+                            "areas_vacios": areas_detectadas
+                        }
                     }
 
             except Exception as e:
                 st.error(f"❌ Error al procesar: {e}")
 
 # ==============================================================================
-# 3. INTERFAZ, AUDITORÍA Y DESCARGA
+# 3. INTERFAZ Y TELEMETRÍA EN PANTALLA
 # ==============================================================================
 if st.session_state['datos_proyecto']:
     m = st.session_state['metrics']
@@ -409,6 +402,10 @@ if st.session_state['datos_proyecto']:
     col4.metric("🪑 Asientos Diseñados", f"{m['asientos']} Pax")
 
     st.success(f"Cota N.P.T.: {m['npt']} m | Área Útil: {m['area']} m²")
+
+    # TELEMETRÍA TÉCNICA VISIBLE
+    t = m['telemetria']
+    st.info(f"📊 **Telemetría Geométrica:** Líneas leídas: {t['num_muros']} | Dimensión mayor: {t['dim_mayor']} (Factor escala: {t['factor']}) | Polígonos cerrados detectados: {t['areas_vacios']} m²")
 
     with st.expander(f"🔍 Auditoría de Textos y Cotas CAD ({m['total_textos']} elementos extraídos)"):
         st.write("**Anotaciones dentro del recinto:**", m['textos_dentro'] if m['textos_dentro'] else "Ninguno")
